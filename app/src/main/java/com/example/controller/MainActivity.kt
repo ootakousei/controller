@@ -3,9 +3,13 @@ package com.example.controller
 import android.R.attr.translateX
 import android.R.attr.translateY
 import android.app.ActivityManager
+import android.app.AlarmManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.util.Xml
 import android.view.InputDevice
@@ -42,13 +46,17 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import kotlin.concurrent.thread
 import kotlin.math.sqrt
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -82,6 +90,10 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var socket: DatagramSocket
     private lateinit var address: InetAddress
+    private lateinit var logSocket: DatagramSocket
+
+    // 通信用コルーチンをまとめて保持するJob（Activity破棄時のキャンセル・クローズ処理に使用）
+    private var networkJob: Job? = null
 
     private val prefs by lazy { getSharedPreferences("controller_prefs", Context.MODE_PRIVATE) }
 
@@ -101,7 +113,7 @@ class MainActivity : ComponentActivity() {
     private var r1 by mutableStateOf(false)
     private var r2 by mutableStateOf(false)
 
-    private var posX by mutableStateOf(2200.0)
+    private var posX by mutableStateOf(4000.0)
     private var posY by mutableStateOf(500.0)
     private var posTheta by mutableStateOf(0.0)
     private var logList by mutableStateOf<List<String>>(emptyList())
@@ -157,7 +169,7 @@ class MainActivity : ComponentActivity() {
     private var lowGain by mutableStateOf(false)
     private var baketuSpeed by mutableStateOf(4.5f)
     private var hataSpeed by mutableStateOf(10.2f)
-
+    private var isHojuPositioningEnabled by mutableStateOf(false)
     // 速度調整の1回あたりの変化量
     private val speedStep = 0.1f
     // クラス内、logListの定義の近くに追加
@@ -268,6 +280,13 @@ class MainActivity : ComponentActivity() {
             event.source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
         ) {
             when (keyCode) {
+                // PSボタンでTurn調整対象を HATA -> BAKETU -> HOJU -> HATA の順に切り替える
+                KeyEvent.KEYCODE_BUTTON_MODE -> {
+                    if (event.repeatCount == 0) {
+                        cycleTurnTarget()
+                    }
+                    return true
+                }
                 KeyEvent.KEYCODE_BUTTON_A -> { cross = true; return true }
                 KeyEvent.KEYCODE_BUTTON_B -> { circle = true; return true }
                 KeyEvent.KEYCODE_BUTTON_X -> { square = true; return true }
@@ -328,110 +347,22 @@ class MainActivity : ComponentActivity() {
         hideSystemUI()
         startLockTaskMode()
 
-        thread {
-            try {
-                socket = DatagramSocket()
-                address = InetAddress.getByName(ip)
-            } catch (e: Exception) { appendLog("SOCKET ERROR: ${e.javaClass.simpleName} ${e.message}")}
-        }
-
-        thread {
-            while (true) {
-                if (::socket.isInitialized &&
-                    (currentScreen == ScreenState.CONTROLLER || currentScreen == ScreenState.RECOVERY ||
-                            currentScreen == ScreenState.ADJUSTMENT)) {
-                    send(
-                        selectedMapID,
-                        if (lowGain) vy / 2f else vy,
-                        if (lowGain) vx / 2f else vx,
-                        if (lowGain) w / 2f else w, hataSpeed,
-                        baketuSpeed,
-                        hata_turnx, hata_turny, hata_turntheta,
-                        hoju_turnx, hoju_turny, hoju_turntheta,
-                        baketu_turnx, baketu_turny, baketu_turntheta,
-                        mode = when(currentScreen) {
-                            ScreenState.RECOVERY -> "recovery"
-                            ScreenState.ADJUSTMENT -> "adjustment"
-                            else -> "normal"
-                        },
-                        column1, column2, column3,
-                        execute, refill,reload1, reload2, reload3, firehata, firebaketu,t0,
-                        left, right, up, down,
-                        circle, triangle, square, cross,
-                        l1, l2, r1, r2
-                    )
+        // --- 通信処理 ---
+        // ソケット初期化に失敗した場合は一定回数再試行し、それでも失敗した場合は
+        // アプリ自身を再起動して初期化をやり直す。
+        networkJob = lifecycleScope.launch(Dispatchers.IO) {
+            if (!initializeNetworkWithRetry()) {
+                appendLog("NETWORK INIT FAILED: restarting app")
+                withContext(Dispatchers.Main) {
+                    restartApp()
                 }
-                Thread.sleep(10)
+                return@launch
             }
-        }
 
-        thread {
-            val buf = ByteArray(1024)
-            while (true) {
-                try {
-                    if (::socket.isInitialized) {
-                        val packet = DatagramPacket(buf, buf.size)
-                        socket.receive(packet)
-
-                        val jsonString = String(packet.data, 0, packet.length)
-                        try {
-                            val json = JSONObject(jsonString)
-
-                            posX = json.optDouble("x", 0.0)
-                            posY = json.optDouble("y", 0.0)
-                            posTheta = json.optDouble("theta", 0.0)
-                        } catch (e: Exception) {
-                            appendLog("RECV ERROR: ${e.javaClass.simpleName} ${e.message}")
-                        }
-                        val rtt = (System.nanoTime() - sendTime) / 1_000_000
-                        if (rttList.size > 50) rttList.removeAt(0)
-                        rttList.add(rtt)
-                    }
-                } catch (e: Exception) {
-                    appendLog("RECV ERROR: ${e.javaClass.simpleName} ${e.message}")
-                }
-            }
-        }
-        thread {
-            val logSocket = DatagramSocket(5006)
-            val buf = ByteArray(1024)
-
-            while (true) {
-                try {
-                    val packet = DatagramPacket(buf, buf.size)
-                    logSocket.receive(packet)
-
-                    val jsonString = String(
-                        packet.data,
-                        0,
-                        packet.length
-                    )
-
-                    val json = JSONObject(jsonString)
-                    val receivedLog = json.optString("log", "")
-
-                    if (
-                        receivedLog.isNotBlank() &&
-                        !receivedLog.equals("none", ignoreCase = true)
-                    ) {
-                        val newLines = receivedLog
-                            .split("\n")
-                            .filter {
-                                it.isNotBlank() &&
-                                        !it.equals("none", ignoreCase = true)
-                            }
-
-                        if (newLines.isNotEmpty()) {
-                            runOnUiThread {
-                                logList = (logList + newLines).takeLast(50)
-                            }
-                        }
-                    }
-
-                } catch (e: Exception) {
-                    appendLog("RECV ERROR: ${e.javaClass.simpleName} ${e.message}")
-                }
-            }
+            // 初期化完了後に、送信・受信・ログ受信を開始する。
+            launch { sendLoop() }
+            launch { receiveLoop() }
+            launch { logReceiveLoop() }
         }
         setContent {
             when (currentScreen) {
@@ -500,6 +431,8 @@ class MainActivity : ComponentActivity() {
                         pulexecute = { pulseExecute() },
                         hataSpeed = hataSpeed,
                         baketuSpeed = baketuSpeed,onNavigateTo = { targetScreen -> currentScreen = targetScreen },
+                        isHojuPositioningEnabled = isHojuPositioningEnabled,
+                        onToggleHojuPositioning = { isHojuPositioningEnabled = !isHojuPositioningEnabled} ,
                         logList = logList
                     )
                 }
@@ -549,7 +482,7 @@ class MainActivity : ComponentActivity() {
                         hataSpeed = hataSpeed,
                         baketuSpeed = baketuSpeed,
                         onHataSpeedIncrease = {
-                            hataSpeed = (hataSpeed + speedStep).coerceAtMost(10.2f)
+                            hataSpeed = (hataSpeed + speedStep).coerceAtMost(11.2f)
                         },
                         onHataSpeedDecrease = {
                             hataSpeed = (hataSpeed - speedStep).coerceAtLeast(9.0f)
@@ -565,6 +498,204 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * 通信ソケットの初期化を行う。部分的に初期化できた場合も必ず後始末してから再試行する。
+     */
+    private suspend fun initializeNetworkWithRetry(maxRetries: Int = 5): Boolean {
+        repeat(maxRetries) { attempt ->
+            var newSocket: DatagramSocket? = null
+            var newLogSocket: DatagramSocket? = null
+
+            try {
+                newSocket = DatagramSocket()
+                val newAddress = InetAddress.getByName(ip)
+                newLogSocket = DatagramSocket(5006)
+
+                socket = newSocket
+                address = newAddress
+                logSocket = newLogSocket
+
+                appendLog("SOCKET INIT OK (attempt ${attempt + 1}/$maxRetries)")
+                return true
+            } catch (e: Exception) {
+                try {
+                    newSocket?.close()
+                } catch (_: Exception) {
+                }
+                try {
+                    newLogSocket?.close()
+                } catch (_: Exception) {
+                }
+
+                // 既存のソケットが残っている場合も閉じて、次の試行に備える。
+                closeSockets()
+
+                appendLog(
+                    "SOCKET INIT ERROR " +
+                            "(${attempt + 1}/$maxRetries): " +
+                            "${e.javaClass.simpleName} ${e.message}"
+                )
+
+                if (attempt < maxRetries - 1) {
+                    delay(1000)
+                }
+            }
+        }
+
+        return false
+    }
+
+    /**
+     * 現在のActivityを終了し、ランチャーActivityを1秒後に再起動する。
+     * onPause() でプロセスを終了する既存実装とも競合しないよう、
+     * 再起動予約を行ってからタスクとプロセスを終了する。
+     */
+    private fun restartApp() {
+        try {
+            val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+            if (launchIntent == null) {
+                appendLog("APP RESTART ERROR: launch intent not found")
+                return
+            }
+
+            launchIntent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_CLEAR_TASK
+            )
+
+            val pendingIntent = PendingIntent.getActivity(
+                this,
+                1001,
+                launchIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            alarmManager.set(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 1000L,
+                pendingIntent
+            )
+
+            networkJob?.cancel()
+            closeSockets()
+            finishAndRemoveTask()
+
+            android.os.Process.killProcess(android.os.Process.myPid())
+        } catch (e: Exception) {
+            appendLog("APP RESTART ERROR: ${e.javaClass.simpleName} ${e.message}")
+        }
+    }
+
+    /**
+     * 送信ループ。10msごとに現在の操作状態をUDPで送信する。
+     * lifecycleScope.launch(Dispatchers.IO) の子コルーチンとして起動される想定。
+     */
+    private suspend fun CoroutineScope.sendLoop() {
+        while (isActive) {
+            if (currentScreen == ScreenState.CONTROLLER || currentScreen == ScreenState.RECOVERY ||
+                currentScreen == ScreenState.ADJUSTMENT
+            ) {
+                send(
+                    selectedMapID,
+                    if (lowGain) vy / 2f else vy,
+                    if (lowGain) vx / 2f else vx,
+                    if (lowGain) w / 2f else w, hataSpeed,
+                    baketuSpeed,
+                    hata_turnx, hata_turny, hata_turntheta,
+                    hoju_turnx, hoju_turny, hoju_turntheta,
+                    baketu_turnx, baketu_turny, baketu_turntheta,
+                    mode = when (currentScreen) {
+                        ScreenState.RECOVERY -> "recovery"
+                        ScreenState.ADJUSTMENT -> "adjustment"
+                        else -> "normal"
+                    },
+                    column1, column2, column3,
+                    execute, refill, reload1, reload2, reload3, firehata, firebaketu, t0, isHojuPositioningEnabled,
+                    left, right, up, down,
+                    circle, triangle, square, cross,
+                    l1, l2, r1, r2
+                )
+            }
+            delay(10)
+        }
+    }
+
+    /**
+     * 受信ループ。ロボットから送られてくる自己位置情報を受信する。
+     */
+    private suspend fun CoroutineScope.receiveLoop() {
+        val buf = ByteArray(1024)
+        while (isActive) {
+            try {
+                val packet = DatagramPacket(buf, buf.size)
+                socket.receive(packet) // ブロッキングI/O（Dispatchers.IOで実行される）
+
+                val jsonString = String(packet.data, 0, packet.length)
+                try {
+                    val json = JSONObject(jsonString)
+
+                    posX = json.optDouble("x", 0.0)
+                    posY = json.optDouble("y", 0.0)
+                    posTheta = json.optDouble("theta", 0.0)
+                } catch (e: Exception) {
+                    appendLog("RECV ERROR: ${e.javaClass.simpleName} ${e.message}")
+                }
+                val rtt = (System.nanoTime() - sendTime) / 1_000_000
+                if (rttList.size > 50) rttList.removeAt(0)
+                rttList.add(rtt)
+            } catch (e: Exception) {
+                // close()によるSocketExceptionはActivity終了時の正常な停止なのでログを出さない
+                if (isActive) {
+                    appendLog("RECV ERROR: ${e.javaClass.simpleName} ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * ログ受信ループ。ロボット側から送られてくるデバッグログを受信する。
+     */
+    private suspend fun CoroutineScope.logReceiveLoop() {
+        val buf = ByteArray(1024)
+        while (isActive) {
+            try {
+                val packet = DatagramPacket(buf, buf.size)
+                logSocket.receive(packet) // ブロッキングI/O（Dispatchers.IOで実行される）
+
+                val jsonString = String(packet.data, 0, packet.length)
+                val json = JSONObject(jsonString)
+                val receivedLog = json.optString("log", "")
+
+                if (receivedLog.isNotBlank() && !receivedLog.equals("none", ignoreCase = true)) {
+                    val newLines = receivedLog
+                        .split("\n")
+                        .filter { it.isNotBlank() && !it.equals("none", ignoreCase = true) }
+
+                    if (newLines.isNotEmpty()) {
+                        runOnUiThread {
+                            logList = (logList + newLines).takeLast(50)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                if (isActive) {
+                    appendLog("RECV ERROR: ${e.javaClass.simpleName} ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun cycleTurnTarget() {
+        selectedTurnTarget = when (selectedTurnTarget) {
+            TurnTarget.HATA -> TurnTarget.BAKETU
+            TurnTarget.BAKETU -> TurnTarget.HOJU
+            TurnTarget.HOJU -> TurnTarget.HATA
+        }
+        appendLog("TURN TARGET: ${selectedTurnTarget.displayName()}")
     }
 
     private fun adjustSelectedTurn(
@@ -703,12 +834,13 @@ class MainActivity : ComponentActivity() {
         mode: String,
         column1: String, column2: String, column3: String,
         execute: Boolean, refill: Boolean, reload1: Boolean, reload2: Boolean, reload3: Boolean,firehata: Boolean,firebaketu: Boolean, t0: Boolean,
+        isHojuPositioningEnabled: Boolean,
         left: Boolean, right: Boolean, up: Boolean, down: Boolean,
         circle: Boolean, triangle: Boolean, square: Boolean, cross: Boolean,
         l1: Boolean, l2: Boolean, r1: Boolean, r2: Boolean
     ) {
         try {
-            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed":$hataSpeed,"baketu_speed":$baketuSpeed,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"mode":"$mode","column1":"$column1","column2":"$column2","column3":"$column3","execute":$execute,"refill":$refill,"reload1":$reload1,"reload2":$reload2,"reload3":$reload3,"firehata":$firehata,"firebaketu":$firebaketu,"t0":$t0,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2}"""
+            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed":$hataSpeed,"baketu_speed":$baketuSpeed,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"mode":"$mode","column1":"$column1","column2":"$column2","column3":"$column3","execute":$execute,"refill":$refill,"reload1":$reload1,"reload2":$reload2,"reload3":$reload3,"firehata":$firehata,"firebaketu":$firebaketu,"t0":$t0,"HojuPosition":$isHojuPositioningEnabled,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2}"""
             val buf = msg.toByteArray()
             val packet = DatagramPacket(buf, buf.size, address, port)
             sendTime = System.nanoTime()
@@ -716,6 +848,32 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             appendLog("SEND ERROR: ${e.javaClass.simpleName} ${e.message}")
         }
+    }
+
+    /**
+     * ソケットを安全にクローズする。DatagramSocket#close()は複数回呼んでも安全なため、
+     * onPause() / onDestroy() のどちらから呼ばれても問題ない。
+     * close()すると受信ループがブロックしているsocket.receive()が即座に
+     * SocketExceptionを送出して抜けるため、スレッド（コルーチン）を安全に終了できる。
+     */
+    private fun closeSockets() {
+        try {
+            if (::socket.isInitialized) socket.close()
+        } catch (e: Exception) {
+            appendLog("SOCKET CLOSE ERROR: ${e.javaClass.simpleName} ${e.message}")
+        }
+        try {
+            if (::logSocket.isInitialized) logSocket.close()
+        } catch (e: Exception) {
+            appendLog("SOCKET CLOSE ERROR: ${e.javaClass.simpleName} ${e.message}")
+        }
+    }
+
+    override fun onDestroy() {
+        // Activity破棄時：通信用コルーチンをキャンセルし、ソケットを確実にクローズする
+        networkJob?.cancel()
+        closeSockets()
+        super.onDestroy()
     }
 
     override fun onPause() {
@@ -734,6 +892,9 @@ class MainActivity : ComponentActivity() {
             .putFloat("hata_speed", hataSpeed)
             .putFloat("baketu_speed", baketuSpeed)
             .commit()
+        // アプリ終了前に通信用コルーチンを停止し、ソケットを安全にクローズする
+        networkJob?.cancel()
+        closeSockets()
         finishAndRemoveTask()
         android.os.Process.killProcess(android.os.Process.myPid())
     }
@@ -853,6 +1014,8 @@ fun ControllerUI(
     pulexecute: () -> Unit,
     hataSpeed: Float,
     baketuSpeed: Float,
+    isHojuPositioningEnabled: Boolean,
+    onToggleHojuPositioning: () -> Unit,
     logList: List<String>
 ) {
 
@@ -888,19 +1051,24 @@ fun ControllerUI(
                 val scaleY = size.height / mapHeight
                 var tempPx = 0.0
                 var tempPy = 0.0
+                var angleDegrees =0f
                 if (mapID == "bluemap") {
                     tempPx = posX
                     tempPy = posY
+                    angleDegrees = Math.toDegrees(posTheta).toFloat()
+
                 } else {
-                    tempPx = -posX
-                    tempPy = -posY
+                    tempPx = posX
+                    tempPy = posY
+                    angleDegrees = -Math.toDegrees(posTheta).toFloat()
+
                 }
 
                 val px = size.height - (tempPx * scaleX).toFloat()
                 val py = (-tempPy * scaleY).toFloat()
                 val robotPos = Offset(px, py)
 
-                val angleDegrees = Math.toDegrees(posTheta).toFloat()
+
                 val translateX: Float
                 val translateY: Float
 
@@ -922,7 +1090,7 @@ fun ControllerUI(
                         translateX,
                         translateY
                     )
-                    rotate(degrees = -angleDegrees + 180f, pivot = Offset.Zero)
+                    rotate(degrees = -angleDegrees - 90f, pivot = Offset.Zero)
                     scale(scaleX = 0.15f, scaleY = 0.15f, pivot = Offset.Zero)
                 }) {
                     drawImage(
@@ -953,7 +1121,7 @@ fun ControllerUI(
             posY,
             posTheta
         )
-
+        val canExecute = isHojuPositioningEnabled && hojuInRange
         // 左側：ステータス表示
         Column(modifier = Modifier.align(Alignment.TopStart).padding(16.dp)) {
 
@@ -1030,9 +1198,28 @@ fun ControllerUI(
 
             // 常にすべてのターゲティング調整値をまとめて表示する例
             Column {
+                Text(
+                    "TURN ADJUST: ${selectedTurnTarget.displayName()}",
+                    color = Color.Yellow,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp
+                )
                 Text("HATA   X ${"%.2f".format(hataTurnX)} Y ${"%.2f".format(hataTurnY)} θ ${"%.2f".format(hataTurnTheta)}", color = Color.White, fontSize = 11.sp)
                 Text("BAKETU X ${"%.2f".format(baketuTurnX)} Y ${"%.2f".format(baketuTurnY)} θ ${"%.2f".format(baketuTurnTheta)}", color = Color.White, fontSize = 11.sp)
                 Text("HOJU   X ${"%.2f".format(hojuTurnX)} Y ${"%.2f".format(hojuTurnY)} θ ${"%.2f".format(hojuTurnTheta)}", color = Color.White, fontSize = 11.sp)
+                Text(
+                    "HATA SPEED: ${"%.1f".format(hataSpeed)}",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp
+                )
+
+                Text(
+                    "BAKETU SPEED: ${"%.1f".format(baketuSpeed)}",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp
+                )
             }
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -1041,49 +1228,92 @@ fun ControllerUI(
             ColumnButton(label = "Column 1: $column1", onClick = onColumn1Change)
             ColumnButton(label = "Column 2: $column2", onClick = onColumn2Change)
             ColumnButton(label = "Column 3: $column3", onClick = onColumn3Change)
-            LaunchedEffect(square, hojuInRange) {
-                if (square && hojuInRange) {
+            LaunchedEffect(square, canExecute) {
+                if (square && canExecute) {
                     pulexecute()
+                    if (isHojuPositioningEnabled) {
+                        onToggleHojuPositioning()
+                    }
                 }
             }
             Button(
                 onClick = {
-                    if (hojuInRange) {
+                    if (canExecute) {
                         onExecute()
+                        if (isHojuPositioningEnabled) {
+                            onToggleHojuPositioning()
+                        }
                     }
                 },
                 modifier = Modifier
                     .width(180.dp)
                     .height(60.dp),
                 shape = RoundedCornerShape(12.dp),
+                enabled = canExecute, // 条件を満たしていない場合はボタンを非無効化（インターフェース的にも押せない状態）
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (execute) {
                         Color(0xFF4CAF50)
-                    } else if (hojuInRange) {
+                    } else if (canExecute) {
                         Color(0xFF0F1E17)
                     } else {
-                        Color.Gray
-                    }
+                        Color.Green
+                    },
+                    disabledContainerColor = Color.Gray
                 )
             ) {
                 Text(
-                    if (hojuInRange) "実行" else "範囲外",
+                    text = when {
+                        execute -> "実行中"
+                        !isHojuPositioningEnabled -> "トグルOFF"
+
+                        else -> "実行"
+                    },
                     fontWeight = FontWeight.Bold,
-                    fontSize = 20.sp
+                    fontSize = 18.sp,
+                    color = if (canExecute) Color.White else Color.LightGray
                 )
             }
         }
-
+        // 補充位置決めボタン
+        Button(
+            onClick = {
+                // 範囲内のときのみトグル切替を許可
+                if (hojuInRange) {
+                    onToggleHojuPositioning()
+                }
+            },
+            modifier = Modifier
+                .width(130.dp)
+                .height(60.dp)
+                .offset(480.dp, 170.dp),
+            shape = RoundedCornerShape(8.dp),
+            enabled = hojuInRange, // 範囲外のときはボタンを押せないように制御
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (isHojuPositioningEnabled) Color(0xFF4CAF50) else Color(0xFF757575),
+                disabledContainerColor = Color.Blue
+            )
+        ) {
+            Text(
+                text = when {
+                    !hojuInRange -> "補充: 範囲外"
+                    isHojuPositioningEnabled -> "補充位置決め: ON"
+                    else -> "補充位置決め: OFF"
+                },
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+                color = if (hojuInRange) Color.White else Color.LightGray
+            )
+        }
         // t0
         Button(
             onClick = onToggleT0,
-            modifier = Modifier.align(Alignment.BottomStart).padding(100.dp).size(120.dp).offset(390.dp,70.dp),
+            modifier = Modifier.align(Alignment.BottomStart).padding(100.dp).size(80.dp).offset(390.dp,70.dp),
             shape = androidx.compose.foundation.shape.CircleShape,
             colors = ButtonDefaults.buttonColors(
                 containerColor = if (t0) Color(0xFF4CAF50) else Color(0xFFF44336)
             )
         ) {
-            Text(if (t0) "ENABLED" else "DISABLED", fontWeight = FontWeight.Bold)
+            Text(if (t0) "ON" else "OFF", fontWeight = FontWeight.Bold)
         }
 
         // 右上：画面遷移ボタン・スピード値表示（表示専用）
@@ -1097,17 +1327,7 @@ fun ControllerUI(
 
 
 
-            Text(
-                "HATA SPEED: ${"%.1f".format(hataSpeed)}",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
 
-            Text(
-                "BAKETU SPEED: ${"%.1f".format(baketuSpeed)}",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
         }
         // ControllerUI 内の Box の直下に追加
         ModeSwitchButtons(
@@ -1240,19 +1460,22 @@ fun RecoveryUI(
                 val scaleY = size.height / mapHeight
                 var tempPx = 0.0
                 var tempPy = 0.0
+                var angleDegrees=0f
                 if (mapID == "bluemap") {
                     tempPx = posX
                     tempPy = posY
-                } else {
-                    tempPx = -posX
-                    tempPy = -posY
-                }
+                    angleDegrees = Math.toDegrees(posTheta).toFloat()
 
+                } else {
+                    tempPx = posX
+                    tempPy = posY
+                    angleDegrees = -Math.toDegrees(posTheta).toFloat()
+
+                }
                 val px = size.height - (tempPx * scaleX).toFloat()
                 val py = (-tempPy * scaleY).toFloat()
                 val robotPos = Offset(px, py)
 
-                val angleDegrees = Math.toDegrees(posTheta).toFloat()
                 val translateX: Float
                 val translateY: Float
 
@@ -1269,7 +1492,7 @@ fun RecoveryUI(
                         translateX,
                         translateY
                     )
-                    rotate(degrees = -angleDegrees + 180f, pivot = Offset.Zero)
+                    rotate(degrees = -angleDegrees -90f, pivot = Offset.Zero)
                     scale(scaleX = 0.15f, scaleY = 0.15f, pivot = Offset.Zero)
                 }) {
                     drawImage(
@@ -1626,7 +1849,7 @@ fun ModeSwitchButtons(
     modifier: Modifier = Modifier
 ) {
     val activeColor = Color(0xFFFF9800)
-    val inactiveColor = Color(0xFF424242)
+    val inactiveColor = Color(0xFF03A9F4)
 
     Column(
         modifier = modifier,
