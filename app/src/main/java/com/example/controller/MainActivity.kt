@@ -20,6 +20,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -159,7 +160,7 @@ class MainActivity : ComponentActivity() {
 
     // turn調整の1回あたりの変化量
     private val turnXYStep = 10f
-    private val turnThetaStep = 2f
+    private val turnThetaStep = 0.5f
     private var prevDpadLeft = false
     private var prevDpadRight = false
     private var prevDpadUp = false
@@ -432,7 +433,9 @@ class MainActivity : ComponentActivity() {
                         hataSpeed = hataSpeed,
                         baketuSpeed = baketuSpeed,onNavigateTo = { targetScreen -> currentScreen = targetScreen },
                         isHojuPositioningEnabled = isHojuPositioningEnabled,
-                        onToggleHojuPositioning = { isHojuPositioningEnabled = !isHojuPositioningEnabled} ,
+                        onToggleHojuPositioning = {
+                            updateHojuPositioningEnabled(!isHojuPositioningEnabled)
+                        },
                         logList = logList
                     )
                 }
@@ -475,14 +478,19 @@ class MainActivity : ComponentActivity() {
                     AdjustmentUI(
                         isFlipped = isFlipped,
                         selectedTurnTarget = selectedTurnTarget,
-                        onSelectTurnTarget = { target -> selectedTurnTarget = target },
+                        onSelectTurnTarget = { target ->
+                            if (!isHojuPositioningEnabled || target == TurnTarget.HOJU) {
+                                selectedTurnTarget = target
+                            }
+                        },
                         hataTurnX = hata_turnx, hataTurnY = hata_turny, hataTurnTheta = hata_turntheta,
                         baketuTurnX = baketu_turnx, baketuTurnY = baketu_turny, baketuTurnTheta = baketu_turntheta,
                         hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
+                        hojuPositioningEnabled = isHojuPositioningEnabled,
                         hataSpeed = hataSpeed,
                         baketuSpeed = baketuSpeed,
                         onHataSpeedIncrease = {
-                            hataSpeed = (hataSpeed + speedStep).coerceAtMost(11.2f)
+                            hataSpeed = (hataSpeed + speedStep).coerceAtMost(10.2f)
                         },
                         onHataSpeedDecrease = {
                             hataSpeed = (hataSpeed - speedStep).coerceAtLeast(9.0f)
@@ -689,7 +697,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun updateHojuPositioningEnabled(enabled: Boolean) {
+        isHojuPositioningEnabled = enabled
+        if (enabled) {
+            selectedTurnTarget = TurnTarget.HOJU
+            appendLog("TURN TARGET: HOJU (Hoju positioning ON)")
+        }
+    }
+
     private fun cycleTurnTarget() {
+        if (isHojuPositioningEnabled) {
+            selectedTurnTarget = TurnTarget.HOJU
+            appendLog("TURN TARGET LOCKED: HOJU")
+            return
+        }
+
         selectedTurnTarget = when (selectedTurnTarget) {
             TurnTarget.HATA -> TurnTarget.BAKETU
             TurnTarget.BAKETU -> TurnTarget.HOJU
@@ -901,6 +923,127 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
+ * ============================================================
+ * UI THEME
+ * ============================================================
+ * 配置・操作系は維持し、色・階層・余白・表示の見せ方を統一する。
+ */
+private object ControllerColors {
+    val Background = Color(0xFF0B0F12)
+    val Surface = Color(0xFF11181D)
+    val Surface2 = Color(0xFF172128)
+    val Border = Color(0xFF293840)
+    val BorderAccent = Color(0xFF00D9FF)
+
+    val TextPrimary = Color(0xFFEAF3F7)
+    val TextSecondary = Color(0xFF8C9AA2)
+    val TextMuted = Color(0xFF5C6970)
+
+    val Accent = Color(0xFF00D9FF)
+    val Success = Color(0xFF39D98A)
+    val Warning = Color(0xFFFFB547)
+    val Danger = Color(0xFFFF4D5A)
+
+    val Red = Color(0xFF8F2530)
+    val Blue = Color(0xFF175F8A)
+    val Neutral = Color(0xFF2A353B)
+}
+
+@Composable
+private fun HudPanel(
+    modifier: Modifier = Modifier,
+    accent: Color = ControllerColors.BorderAccent,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Column(
+        modifier = modifier
+            .background(
+                color = ControllerColors.Surface,
+                shape = RoundedCornerShape(8.dp)
+            )
+            .border(
+                width = 1.dp,
+                color = ControllerColors.Border,
+                shape = RoundedCornerShape(8.dp)
+            )
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        content = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .background(accent, RoundedCornerShape(2.dp))
+            )
+            content()
+        }
+    )
+}
+
+@Composable
+private fun HudSectionTitle(
+    text: String,
+    color: Color = ControllerColors.Accent,
+    fontSize: androidx.compose.ui.unit.TextUnit = 12.sp
+) {
+    Text(
+        text = text,
+        color = color,
+        fontSize = fontSize,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 1.sp
+    )
+}
+
+@Composable
+private fun HudButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier,
+    containerColor: Color = ControllerColors.Surface2,
+    contentColor: Color = ControllerColors.TextPrimary,
+    enabled: Boolean = true,
+    height: androidx.compose.ui.unit.Dp = 50.dp,
+    fontSize: androidx.compose.ui.unit.TextUnit = 14.sp,
+    accent: Color = ControllerColors.Border
+) {
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier.height(height),
+        shape = RoundedCornerShape(7.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = containerColor,
+            contentColor = contentColor,
+            disabledContainerColor = ControllerColors.Neutral.copy(alpha = 0.55f),
+            disabledContentColor = ControllerColors.TextMuted
+        ),
+        elevation = ButtonDefaults.buttonElevation(
+            defaultElevation = 0.dp,
+            pressedElevation = 0.dp,
+            focusedElevation = 0.dp,
+            hoveredElevation = 0.dp,
+            disabledElevation = 0.dp
+        ),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .border(1.dp, accent, RoundedCornerShape(7.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = text,
+                fontSize = fontSize,
+                fontWeight = FontWeight.Bold,
+                color = contentColor
+            )
+        }
+    }
+}
+
+/**
  * チーム（赤・青）選択用UI画面
  */
 @Composable
@@ -913,7 +1056,7 @@ fun TeamSelectionScreen(
         modifier = Modifier
             .fillMaxSize()
             .rotate(if (isFlipped) 180f else 0f)
-            .background(Color.DarkGray),
+            .background(ControllerColors.Background),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -924,7 +1067,8 @@ fun TeamSelectionScreen(
                 text = "SELECT FIELD SIDE",
                 fontSize = 28.sp,
                 fontWeight = FontWeight.Bold,
-                color = Color.White
+                color = ControllerColors.TextPrimary,
+                letterSpacing = 2.sp
             )
 
             Row(
@@ -932,50 +1076,54 @@ fun TeamSelectionScreen(
             ) {
                 Button(
                     onClick = { onSelectTeam("redmap") },
-                    modifier = Modifier.size(width = 180.dp, height = 120.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                    modifier = Modifier
+                        .size(width = 180.dp, height = 120.dp)
+                        .border(1.dp, ControllerColors.Danger.copy(alpha = 0.65f), RoundedCornerShape(12.dp)),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF531920)
+                    ),
+                    elevation = ButtonDefaults.buttonElevation(0.dp)
                 ) {
                     Text(
                         text = "RED",
                         fontSize = 32.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color.White
+                        color = ControllerColors.TextPrimary,
+                        letterSpacing = 2.sp
                     )
                 }
 
                 Button(
                     onClick = { onSelectTeam("bluemap") },
-                    modifier = Modifier.size(width = 180.dp, height = 120.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1976D2))
+                    modifier = Modifier
+                        .size(width = 180.dp, height = 120.dp)
+                        .border(1.dp, ControllerColors.Accent.copy(alpha = 0.65f), RoundedCornerShape(12.dp)),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF123D59)
+                    ),
+                    elevation = ButtonDefaults.buttonElevation(0.dp)
                 ) {
                     Text(
                         text = "BLUE",
                         fontSize = 32.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color.White
+                        color = ControllerColors.TextPrimary,
+                        letterSpacing = 2.sp
                     )
                 }
             }
 
-            Button(
+            HudButton(
+                text = if (isFlipped) "FLIPPED  /  180°" else "ROTATE SCREEN  /  180°",
                 onClick = onToggleFlip,
-                modifier = Modifier
-                    .width(220.dp)
-                    .height(50.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isFlipped) Color(0xFFFF9800) else Color(0xFF424242)
-                )
-            ) {
-                Text(
-                    text = if (isFlipped) "FLIPPED (180°)" else "ROTATE SCREEN (180°)",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            }
+                modifier = Modifier.width(220.dp),
+                containerColor = if (isFlipped) Color(0xFF5A431B) else ControllerColors.Surface2,
+                contentColor = if (isFlipped) ControllerColors.Warning else ControllerColors.TextPrimary,
+                height = 50.dp,
+                accent = if (isFlipped) ControllerColors.Warning else ControllerColors.Border
+            )
         }
     }
 }
@@ -1018,21 +1166,20 @@ fun ControllerUI(
     onToggleHojuPositioning: () -> Unit,
     logList: List<String>
 ) {
-
     val imageBitmap = ImageBitmap.imageResource(id = R.drawable.blackarrow)
     Box(
         modifier = Modifier
             .fillMaxSize()
             .rotate(if (isFlipped) 180f else 0f)
-            .background(Color.DarkGray),
+            .background(ControllerColors.Background),
     ) {
-
         Box(
             modifier = Modifier
                 .size(370.dp)
-                .offset(x = 120.dp).graphicsLayer {
-                    scaleX = if (mapID == "redmap") -1f else 1f
-                }
+                .offset(x = 120.dp)
+                .background(ControllerColors.Surface, RoundedCornerShape(6.dp))
+                .border(1.dp, ControllerColors.Border, RoundedCornerShape(6.dp))
+                .graphicsLayer { scaleX = if (mapID == "redmap") -1f else 1f }
         ) {
             Image(
                 painter = painterResource(id = R.drawable.robocon_map),
@@ -1051,24 +1198,19 @@ fun ControllerUI(
                 val scaleY = size.height / mapHeight
                 var tempPx = 0.0
                 var tempPy = 0.0
-                var angleDegrees =0f
                 if (mapID == "bluemap") {
                     tempPx = posX
                     tempPy = posY
-                    angleDegrees = Math.toDegrees(posTheta).toFloat()
-
                 } else {
-                    tempPx = posX
-                    tempPy = posY
-                    angleDegrees = -Math.toDegrees(posTheta).toFloat()
-
+                    tempPx = -posX
+                    tempPy = -posY
                 }
 
                 val px = size.height - (tempPx * scaleX).toFloat()
                 val py = (-tempPy * scaleY).toFloat()
                 val robotPos = Offset(px, py)
 
-
+                val angleDegrees = Math.toDegrees(posTheta).toFloat()
                 val translateX: Float
                 val translateY: Float
 
@@ -1080,17 +1222,9 @@ fun ControllerUI(
                     translateY = robotPos.x - 25f
                 }
 
-                Log.d(
-                    "ControllerUI",
-                    "mapID=$mapID robotPos=(${robotPos.x}, ${robotPos.y}) " +
-                            "translate=($translateX, $translateY)"
-                )
                 withTransform({
-                    translate(
-                        translateX,
-                        translateY
-                    )
-                    rotate(degrees = -angleDegrees - 90f, pivot = Offset.Zero)
+                    translate(translateX, translateY)
+                    rotate(degrees = -angleDegrees + 180f, pivot = Offset.Zero)
                     scale(scaleX = 0.15f, scaleY = 0.15f, pivot = Offset.Zero)
                 }) {
                     drawImage(
@@ -1100,236 +1234,192 @@ fun ControllerUI(
                 }
             }
         }
+
         val targetHoju = TargetThreshold(x = 4000.0, y = 441.0, theta = 0.0)
         fun isInRange(target: TargetThreshold, curX: Double, curY: Double, curTheta: Double): Boolean {
             val dx = target.x - curX
             val dy = if (mapID == "redmap") -target.y - curY else target.y - curY
             val dist = sqrt(dx * dx + dy * dy)
-
             val targetNorm = (target.theta % 360.0 + 360.0) % 360.0
             val currentDeg = Math.toDegrees(curTheta)
             val currentNorm = (currentDeg % 360.0 + 360.0) % 360.0
-
             val diffTheta = Math.abs(targetNorm - currentNorm)
             val angleDist = if (diffTheta > 180.0) 360.0 - diffTheta else diffTheta
-
             return dist < target.distErr && angleDist < target.angleErr
         }
-        val hojuInRange = isInRange(
-            targetHoju,
-            posX,
-            posY,
-            posTheta
-        )
+        val hojuInRange = isInRange(targetHoju, posX, posY, posTheta)
         val canExecute = isHojuPositioningEnabled && hojuInRange
-        // 左側：ステータス表示
-        Column(modifier = Modifier.align(Alignment.TopStart).padding(16.dp)) {
 
-            Text(
-                text = if (mapID == "redmap") "RED SIDE" else "BLUE SIDE",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-
-            Text("Robot Pose", fontWeight = FontWeight.Bold, color = Color.Cyan)
-            Text(text = "X: ${"%.2f".format(posX)}", color = Color.White)
-            Text(text = "Y: ${"%.2f".format(posY)}", color = Color.White)
-            Text(text = "θ: ${"%.2f".format(posTheta)}", color = Color.White)
-
-//            Spacer(modifier = Modifier.height(8.dp))
-//
-//            Text("Stick Input", fontWeight = FontWeight.Bold, color = Color.Magenta)
-//            Text(text = "X: ${"%.2f".format(currentVy)}", color = Color.White)
-//            Text(text = "Y: ${"%.2f".format(currentVx)}", color = Color.White)
-//            Text(text = "θ : ${"%.2f".format(currentW)}", color = Color.White)
-//
-//            Text("Gamepad Buttons", fontWeight = FontWeight.Bold, color = Color.Yellow)
-//            Text(text = "D-Pad: ${if(up)"↑" else ""}${if(down)"↓" else ""}${if(left)"←" else ""}${if(right)"→" else ""}", color = Color.White)
-//            Text(text = "Action: ${if(circle)"○ " else ""}${if(cross)"× " else ""}${if(square)"□ " else ""}${if(triangle)"△" else ""}", color = Color.White)
-//            Text(text = "Bumper: ${if(l1)"[L1] " else ""}${if(r1)"[R1]" else ""}", color = Color.White)
-//            Text(text = "Trigger: ${if(l2)"[L2] " else ""}${if(r2)"[R2]" else ""}", color = Color.White)
-            Text(
-                "LOG",
-                fontWeight = FontWeight.Bold,
-                color = Color.White
-            )
-
-            val logScrollState = rememberLazyListState()
-
-            LaunchedEffect(logList.size) {
-                if (logList.isNotEmpty()) {
-                    logScrollState.animateScrollToItem(logList.lastIndex)
-                }
-            }
-
-            LazyColumn(
-                state = logScrollState,
-                modifier = Modifier
-                    .width(140.dp)
-                    .height(170.dp)
+        // 左側：ステータス表示（位置は維持）
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(16.dp)
+                .width(120.dp)
+        ) {
+            HudPanel(
+                modifier = Modifier.fillMaxWidth(),
+                accent = if (mapID == "redmap") ControllerColors.Danger else ControllerColors.Accent
             ) {
-                items(logList) { logLine ->
-                    Text(
-                        text = logLine,
-                        color = Color.Black,
-                        fontSize = 11.sp
-                    )
-                }
-            }
+                Text(
+                    text = if (mapID == "redmap") "RED SIDE" else "BLUE SIDE",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (mapID == "redmap") ControllerColors.Danger else ControllerColors.Accent,
+                    letterSpacing = 1.sp
+                )
 
-            Spacer(modifier = Modifier.height(10.dp))
-            Text("RTT (ms)", fontWeight = FontWeight.Bold, color = Color.White)
-            Column(modifier = Modifier.height(120.dp).verticalScroll(rememberScrollState())) {
-                rttList.asReversed().forEach { Text(text = "$it ms", color = Color.Green) }
+                HudSectionTitle("ROBOT POSE")
+                Text("X   ${"%.2f".format(posX)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+                Text("Y   ${"%.2f".format(posY)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+                Text("θ   ${"%.2f".format(posTheta)}°", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+
+                Text("SYSTEM LOG", color = ControllerColors.TextSecondary, fontWeight = FontWeight.Bold, fontSize = 10.sp, letterSpacing = 1.sp)
+
+                val logScrollState = rememberLazyListState()
+                LaunchedEffect(logList.size) {
+                    if (logList.isNotEmpty()) logScrollState.animateScrollToItem(logList.lastIndex)
+                }
+
+                Box(
+                    modifier = Modifier
+                        .width(140.dp)
+                        .height(170.dp)
+                        .background(ControllerColors.Background, RoundedCornerShape(5.dp))
+                        .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
+                        .padding(5.dp)
+                ) {
+                    LazyColumn(state = logScrollState, modifier = Modifier.fillMaxSize()) {
+                        items(logList) { logLine ->
+                            Text(
+                                text = logLine,
+                                color = ControllerColors.TextSecondary,
+                                fontSize = 10.sp,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+
+                HudSectionTitle("NETWORK RTT")
+                Box(
+                    modifier = Modifier
+                        .width(140.dp)
+                        .height(120.dp)
+                        .background(ControllerColors.Background, RoundedCornerShape(5.dp))
+                        .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
+                        .padding(5.dp)
+                ) {
+                    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                        rttList.asReversed().forEach { rtt ->
+                            Text("$rtt ms", color = ControllerColors.Success, fontSize = 10.sp)
+                        }
+                    }
+                }
             }
         }
 
-        // 右上：turn値の表示(表示専用)と通常モードの列設定
+        // 右上：turn値の表示と通常モードの列設定（位置は維持）
         Column(
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+                .padding(1.dp)
+                .width(195.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
             horizontalAlignment = Alignment.End
         ) {
-
-            // 常にすべてのターゲティング調整値をまとめて表示する例
-            Column {
-                Text(
-                    "TURN ADJUST: ${selectedTurnTarget.displayName()}",
-                    color = Color.Yellow,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp
-                )
-                Text("HATA   X ${"%.2f".format(hataTurnX)} Y ${"%.2f".format(hataTurnY)} θ ${"%.2f".format(hataTurnTheta)}", color = Color.White, fontSize = 11.sp)
-                Text("BAKETU X ${"%.2f".format(baketuTurnX)} Y ${"%.2f".format(baketuTurnY)} θ ${"%.2f".format(baketuTurnTheta)}", color = Color.White, fontSize = 11.sp)
-                Text("HOJU   X ${"%.2f".format(hojuTurnX)} Y ${"%.2f".format(hojuTurnY)} θ ${"%.2f".format(hojuTurnTheta)}", color = Color.White, fontSize = 11.sp)
-                Text(
-                    "HATA SPEED: ${"%.1f".format(hataSpeed)}",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 11.sp
-                )
-
-                Text(
-                    "BAKETU SPEED: ${"%.1f".format(baketuSpeed)}",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 11.sp
-                )
+            HudPanel(modifier = Modifier.fillMaxWidth(), accent = ControllerColors.Warning) {
+                HudSectionTitle("TURN ADJUST  /  ${selectedTurnTarget.displayName()}", ControllerColors.Warning)
+                Text("HATA   X ${"%.2f".format(hataTurnX)}  Y ${"%.2f".format(hataTurnY)}  θ ${"%.2f".format(hataTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 10.sp)
+                Text("BAKETU X ${"%.2f".format(baketuTurnX)}  Y ${"%.2f".format(baketuTurnY)}  θ ${"%.2f".format(baketuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 10.sp)
+                Text("HOJU   X ${"%.2f".format(hojuTurnX)}  Y ${"%.2f".format(hojuTurnY)}  θ ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 10.sp)
+                Text("HATA SPEED   ${"%.1f".format(hataSpeed)}", color = ControllerColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                Text("BAKETU SPEED ${"%.1f".format(baketuSpeed)}", color = ControllerColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 10.sp)
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
-            Text("NORMAL MODE", fontWeight = FontWeight.Bold, color = Color.Cyan, fontSize = 18.sp)
+            HudPanel(modifier = Modifier.fillMaxWidth(), accent = ControllerColors.Accent) {
+                HudSectionTitle("NORMAL MODE", ControllerColors.Accent, 16.sp)
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    ColumnButton(label = "COLUMN 1  /  $column1", onClick = onColumn1Change)
+                    ColumnButton(label = "COLUMN 2  /  $column2", onClick = onColumn2Change)
+                    ColumnButton(label = "COLUMN 3  /  $column3", onClick = onColumn3Change)
+                }
 
-            ColumnButton(label = "Column 1: $column1", onClick = onColumn1Change)
-            ColumnButton(label = "Column 2: $column2", onClick = onColumn2Change)
-            ColumnButton(label = "Column 3: $column3", onClick = onColumn3Change)
-            LaunchedEffect(square, canExecute) {
-                if (square && canExecute) {
-                    pulexecute()
-                    if (isHojuPositioningEnabled) {
-                        onToggleHojuPositioning()
+                LaunchedEffect(square, canExecute) {
+                    if (square && canExecute) {
+                        pulexecute()
+                        if (isHojuPositioningEnabled) onToggleHojuPositioning()
                     }
                 }
-            }
-            Button(
-                onClick = {
-                    if (canExecute) {
-                        onExecute()
-                        if (isHojuPositioningEnabled) {
-                            onToggleHojuPositioning()
-                        }
-                    }
-                },
-                modifier = Modifier
-                    .width(180.dp)
-                    .height(60.dp),
-                shape = RoundedCornerShape(12.dp),
-                enabled = canExecute, // 条件を満たしていない場合はボタンを非無効化（インターフェース的にも押せない状態）
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (execute) {
-                        Color(0xFF4CAF50)
-                    } else if (canExecute) {
-                        Color(0xFF0F1E17)
-                    } else {
-                        Color.Green
-                    },
-                    disabledContainerColor = Color.Gray
-                )
-            ) {
-                Text(
-                    text = when {
-                        execute -> "実行中"
-                        !isHojuPositioningEnabled -> "トグルOFF"
 
-                        else -> "実行"
+                HudButton(
+                    text = when {
+                        execute -> "EXECUTING"
+                        !isHojuPositioningEnabled -> "EXECUTE  /  LOCKED"
+                        else -> "EXECUTE"
                     },
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 18.sp,
-                    color = if (canExecute) Color.White else Color.LightGray
+                    onClick = {
+                        if (canExecute) {
+                            onExecute()
+                            if (isHojuPositioningEnabled) onToggleHojuPositioning()
+                        }
+                    },
+                    modifier = Modifier.width(180.dp),
+                    containerColor = when {
+                        execute -> Color(0xFF124D37)
+                        canExecute -> ControllerColors.Surface2
+                        else -> ControllerColors.Neutral
+                    },
+                    contentColor = if (canExecute || execute) ControllerColors.TextPrimary else ControllerColors.TextMuted,
+                    enabled = canExecute,
+                    height = 60.dp,
+                    fontSize = 16.sp,
+                    accent = when {
+                        execute -> ControllerColors.Success
+                        canExecute -> ControllerColors.Accent
+                        else -> ControllerColors.Border
+                    }
                 )
             }
         }
-        // 補充位置決めボタン
-        Button(
-            onClick = {
-                // 範囲内のときのみトグル切替を許可
-                if (hojuInRange) {
-                    onToggleHojuPositioning()
-                }
+
+        // 補充位置決めボタン（配置は維持）
+        HudButton(
+            text = when {
+                !hojuInRange -> "補充位置決め  /  OUT"
+                isHojuPositioningEnabled -> "補充位置決め  /  ON"
+                else -> "補充位置決め  /  OFF"
             },
+            onClick = { if (hojuInRange) onToggleHojuPositioning() },
             modifier = Modifier
                 .width(130.dp)
-                .height(60.dp)
-                .offset(480.dp, 170.dp),
-            shape = RoundedCornerShape(8.dp),
-            enabled = hojuInRange, // 範囲外のときはボタンを押せないように制御
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (isHojuPositioningEnabled) Color(0xFF4CAF50) else Color(0xFF757575),
-                disabledContainerColor = Color.Blue
-            )
-        ) {
-            Text(
-                text = when {
-                    !hojuInRange -> "補充: 範囲外"
-                    isHojuPositioningEnabled -> "補充位置決め: ON"
-                    else -> "補充位置決め: OFF"
-                },
-                fontWeight = FontWeight.Bold,
-                fontSize = 12.sp,
-                color = if (hojuInRange) Color.White else Color.LightGray
-            )
-        }
+                .offset(505.dp, 170.dp),
+            containerColor = if (isHojuPositioningEnabled) Color(0xFF124D37) else ControllerColors.Surface2,
+            contentColor = if (!hojuInRange) ControllerColors.TextMuted else if (isHojuPositioningEnabled) ControllerColors.Success else ControllerColors.TextPrimary,
+            enabled = hojuInRange,
+            height = 60.dp,
+            fontSize = 11.sp,
+            accent = if (isHojuPositioningEnabled) ControllerColors.Success else ControllerColors.Border
+        )
+
         // t0
         Button(
             onClick = onToggleT0,
-            modifier = Modifier.align(Alignment.BottomStart).padding(100.dp).size(80.dp).offset(390.dp,70.dp),
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(100.dp)
+                .size(80.dp)
+                .offset(390.dp, 70.dp)
+                .border(1.dp, if (t0) ControllerColors.Success else ControllerColors.Danger, androidx.compose.foundation.shape.CircleShape),
             shape = androidx.compose.foundation.shape.CircleShape,
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (t0) Color(0xFF4CAF50) else Color(0xFFF44336)
-            )
+                containerColor = if (t0) Color(0xFF124D37) else Color(0xFF521A22)
+            ),
+            elevation = ButtonDefaults.buttonElevation(0.dp)
         ) {
-            Text(if (t0) "ON" else "OFF", fontWeight = FontWeight.Bold)
+            Text(if (t0) "ON" else "OFF", fontWeight = FontWeight.Bold, color = ControllerColors.TextPrimary)
         }
 
-        // 右上：画面遷移ボタン・スピード値表示（表示専用）
-        Column(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(30.dp).offset(-180.dp, 150.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            horizontalAlignment = Alignment.End
-        ) {
-
-
-
-
-        }
-        // ControllerUI 内の Box の直下に追加
         ModeSwitchButtons(
             currentScreen = ScreenState.CONTROLLER,
             onNavigate = onNavigateTo,
@@ -1350,17 +1440,30 @@ fun TurnTarget.displayName(): String = when (this) {
 fun TurnSelectButton(
     label: String,
     selected: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     Button(
         onClick = onClick,
-        modifier = Modifier.width(90.dp).height(60.dp),
-        shape = RoundedCornerShape(8.dp),
+        enabled = enabled,
+        modifier = Modifier
+            .width(90.dp)
+            .height(60.dp)
+            .border(
+                1.dp,
+                if (selected) ControllerColors.Accent else ControllerColors.Border,
+                RoundedCornerShape(7.dp)
+            ),
+        shape = RoundedCornerShape(7.dp),
         colors = ButtonDefaults.buttonColors(
-            containerColor = if (selected) Color(0xFFFF9800) else Color(0xFF03A9F4)
-        )
+            containerColor = if (selected) Color(0xFF124654) else ControllerColors.Surface2,
+            contentColor = if (selected) ControllerColors.TextPrimary else ControllerColors.TextSecondary,
+            disabledContainerColor = ControllerColors.Neutral.copy(alpha = 0.5f),
+            disabledContentColor = ControllerColors.TextMuted
+        ),
+        elevation = ButtonDefaults.buttonElevation(0.dp)
     ) {
-        Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
     }
 }
 
@@ -1369,22 +1472,29 @@ fun ColumnButton(
     label: String,
     onClick: () -> Unit
 ) {
-    Button(
-        onClick = onClick,
-        modifier = Modifier.width(180.dp).height(50.dp),
-        shape = RoundedCornerShape(10.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = if (label.contains("hata")) {
-                Color(0xFF1A237E)
-            } else if (label.contains("baketu")) {
-                Color(0xFF8B0000)
-            } else {
-                Color(0xFF708278)
-            }
-        )
-    ) {
-        Text(label, color = Color.White, fontWeight = FontWeight.Bold)
+    val isHata = label.contains("hata", ignoreCase = true)
+    val isBaketu = label.contains("baketu", ignoreCase = true)
+    val accent = when {
+        isHata -> ControllerColors.Accent
+        isBaketu -> ControllerColors.Warning
+        else -> ControllerColors.Border
     }
+    val fill = when {
+        isHata -> Color(0xFF123B4A)
+        isBaketu -> Color(0xFF4A351A)
+        else -> ControllerColors.Surface2
+    }
+
+    HudButton(
+        text = label,
+        onClick = onClick,
+        modifier = Modifier.width(180.dp),
+        containerColor = fill,
+        contentColor = ControllerColors.TextPrimary,
+        height = 40.dp,
+        fontSize = 12.sp,
+        accent = accent
+    )
 }
 
 @Composable
@@ -1414,34 +1524,31 @@ fun RecoveryUI(
     onReload2: () -> Unit,
     onReload3: () -> Unit,
     firehata: Boolean,
-    onfirebaketu: () -> Unit,      // 追加
-    firebaketu: Boolean,        // 追加
-    pulfirebaketu: () -> Unit,   // 追加
+    onfirebaketu: () -> Unit,
+    firebaketu: Boolean,
+    pulfirebaketu: () -> Unit,
     pulrefill: () -> Unit,
     pulfirehata: () -> Unit,
     logList: List<String>
 ) {
     val imageBitmap = ImageBitmap.imageResource(id = R.drawable.blackarrow)
     LaunchedEffect(circle, cross) {
-        if (circle) {
-            pulfirehata()
-        } else if (cross) {
-            pulrefill()
-        }
+        if (circle) pulfirehata() else if (cross) pulrefill()
     }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .rotate(if (isFlipped) 180f else 0f)
-            .background(Color.DarkGray)
+            .background(ControllerColors.Background)
     ) {
         Box(
             modifier = Modifier
                 .size(370.dp)
-                .offset(x = 120.dp).graphicsLayer {
-                    scaleX = if (mapID == "redmap") -1f else 1f
-                }
+                .offset(x = 120.dp)
+                .background(ControllerColors.Surface, RoundedCornerShape(6.dp))
+                .border(1.dp, ControllerColors.Border, RoundedCornerShape(6.dp))
+                .graphicsLayer { scaleX = if (mapID == "redmap") -1f else 1f }
         ) {
             Image(
                 painter = painterResource(id = R.drawable.robocon_map),
@@ -1458,24 +1565,12 @@ fun RecoveryUI(
                 val mapHeight = 11700
                 val scaleX = size.width / mapWidth
                 val scaleY = size.height / mapHeight
-                var tempPx = 0.0
-                var tempPy = 0.0
-                var angleDegrees=0f
-                if (mapID == "bluemap") {
-                    tempPx = posX
-                    tempPy = posY
-                    angleDegrees = Math.toDegrees(posTheta).toFloat()
-
-                } else {
-                    tempPx = posX
-                    tempPy = posY
-                    angleDegrees = -Math.toDegrees(posTheta).toFloat()
-
-                }
+                val tempPx = if (mapID == "bluemap") posX else -posX
+                val tempPy = if (mapID == "bluemap") posY else -posY
                 val px = size.height - (tempPx * scaleX).toFloat()
                 val py = (-tempPy * scaleY).toFloat()
                 val robotPos = Offset(px, py)
-
+                val angleDegrees = Math.toDegrees(posTheta).toFloat()
                 val translateX: Float
                 val translateY: Float
 
@@ -1488,11 +1583,8 @@ fun RecoveryUI(
                 }
 
                 withTransform({
-                    translate(
-                        translateX,
-                        translateY
-                    )
-                    rotate(degrees = -angleDegrees -90f, pivot = Offset.Zero)
+                    translate(translateX, translateY)
+                    rotate(degrees = -angleDegrees + 180f, pivot = Offset.Zero)
                     scale(scaleX = 0.15f, scaleY = 0.15f, pivot = Offset.Zero)
                 }) {
                     drawImage(
@@ -1503,203 +1595,164 @@ fun RecoveryUI(
             }
         }
 
-        Column(modifier = Modifier.align(Alignment.TopStart).padding(16.dp)) {
-            Text(
-                text = if (mapID == "redmap") "RED SIDE" else "BLUE SIDE",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color.White
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text("Robot Pose", fontWeight = FontWeight.Bold, color = Color.Cyan)
-            Text("X: ${"%.2f".format(posX)}", color = Color.White)
-            Text("Y: ${"%.2f".format(posY)}", color = Color.White)
-            Text("θ: ${"%.2f".format(posTheta)}", color = Color.White)
-
-            Text(
-                "LOG",
-                fontWeight = FontWeight.Bold,
-                color = Color.White
-            )
-
-            val logScrollState = rememberLazyListState()
-
-            LaunchedEffect(logList.size) {
-                if (logList.isNotEmpty()) {
-                    logScrollState.animateScrollToItem(logList.lastIndex)
-                }
-            }
-
-            LazyColumn(
-                state = logScrollState,
-                modifier = Modifier
-                    .width(140.dp)
-                    .height(170.dp)
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(16.dp)
+                .width(120.dp)
+        ) {
+            HudPanel(
+                modifier = Modifier.fillMaxWidth(),
+                accent = if (mapID == "redmap") ControllerColors.Danger else ControllerColors.Accent
             ) {
-                items(logList) { logLine ->
-                    Text(
-                        text = logLine,
-                        color = Color.Black,
-                        fontSize = 11.sp
-                    )
+                Text(
+                    text = if (mapID == "redmap") "RED SIDE" else "BLUE SIDE",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (mapID == "redmap") ControllerColors.Danger else ControllerColors.Accent,
+                    letterSpacing = 1.sp
+                )
+                HudSectionTitle("ROBOT POSE")
+                Text("X   ${"%.2f".format(posX)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+                Text("Y   ${"%.2f".format(posY)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+                Text("θ   ${"%.2f".format(posTheta)}°", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+                HudSectionTitle("SYSTEM LOG", ControllerColors.TextSecondary, 10.sp)
+
+                val logScrollState = rememberLazyListState()
+                LaunchedEffect(logList.size) {
+                    if (logList.isNotEmpty()) logScrollState.animateScrollToItem(logList.lastIndex)
+                }
+
+                Box(
+                    modifier = Modifier
+                        .width(140.dp)
+                        .height(170.dp)
+                        .background(ControllerColors.Background, RoundedCornerShape(5.dp))
+                        .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
+                        .padding(5.dp)
+                ) {
+                    LazyColumn(state = logScrollState, modifier = Modifier.fillMaxSize()) {
+                        items(logList) { logLine ->
+                            Text(logLine, color = ControllerColors.TextSecondary, fontSize = 10.sp, maxLines = 1)
+                        }
+                    }
+                }
+
+                HudSectionTitle("NETWORK RTT")
+                Box(
+                    modifier = Modifier
+                        .width(140.dp)
+                        .height(120.dp)
+                        .background(ControllerColors.Background, RoundedCornerShape(5.dp))
+                        .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
+                        .padding(5.dp)
+                ) {
+                    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                        rttList.asReversed().forEach { rtt ->
+                            Text("$rtt ms", color = ControllerColors.Success, fontSize = 10.sp)
+                        }
+                    }
                 }
             }
+        }
 
-
-//            Spacer(modifier = Modifier.height(8.dp))
-//            Text("Stick Input", fontWeight = FontWeight.Bold, color = Color.Magenta)
-//            Text("X: ${"%.2f".format(currentVy)}", color = Color.White)
-//            Text("Y: ${"%.2f".format(currentVx)}", color = Color.White)
-//            Text("θ : ${"%.2f".format(currentW)}", color = Color.White)
-//
-//            Text("Gamepad Buttons", fontWeight = FontWeight.Bold, color = Color.Yellow)
-//            Text(
-//                "D-Pad: ${if (up) "↑" else ""}${if (down) "↓" else ""}${if (left) "←" else ""}${if (right) "→" else ""}",
-//                color = Color.White
-//            )
-//            Text(
-//                "Action: ${if (circle) "○ " else ""}${if (cross) "× " else ""}${if (square) "□ " else ""}${if (triangle) "△" else ""}",
-//                color = Color.White
-//            )
-//            Text(
-//                "Bumper: ${if (l1) "[L1] " else ""}${if (r1) "[R1]" else ""}",
-//                color = Color.White
-//            )
-//            Text(
-//                "Trigger: ${if (l2) "[L2] " else ""}${if (r2) "[R2]" else ""}",
-//                color = Color.White
-//            )
-//
-            Spacer(modifier = Modifier.height(10.dp))
-            Text("RTT (ms)", fontWeight = FontWeight.Bold, color = Color.White)
-            Column(modifier = Modifier.height(120.dp).verticalScroll(rememberScrollState())) {
-                rttList.asReversed().forEach { Text(text = "$it ms", color = Color.Green) }
-            }
+        HudPanel(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(16.dp)
+                .width(205.dp).offset(30.dp),
+            accent = ControllerColors.Warning
+        ) {
+            HudSectionTitle("RECOVERY MODE", ControllerColors.Warning, 20.sp)
+            Text("補充・発射操作", color = ControllerColors.TextSecondary, fontSize = 11.sp)
         }
 
         Column(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(16.dp),
-            horizontalAlignment = Alignment.End
+            modifier = Modifier.offset(540.dp, 170.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(
-                "RECOVERY MODE",
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFFFF9800),
-                fontSize = 20.sp
-            )
-            Text("補充・発射操作", color = Color.White, fontSize = 12.sp)
-        }
-
-        Column(modifier=Modifier.offset(540.dp,170.dp),verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
+            HudButton(
+                text = if (reload1) "RL 1  /  ACTIVE" else "RL 1",
                 onClick = onReload1,
-                modifier = Modifier.width(80.dp).height(50.dp),
-                shape = RoundedCornerShape(8.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (reload1) Color(0xFF4CAF50) else Color(0xFF795548)
-                )
-            ) {
-                Text("RL 1", fontWeight = FontWeight.Bold)
-            }
-
-            Button(
+                modifier = Modifier.width(100.dp),
+                containerColor = if (reload1) Color(0xFF124D37) else ControllerColors.Surface2,
+                contentColor = if (reload1) ControllerColors.Success else ControllerColors.TextPrimary,
+                height = 50.dp,
+                fontSize = 11.sp,
+                accent = if (reload1) ControllerColors.Success else ControllerColors.Border
+            )
+            HudButton(
+                text = if (reload2) "RL 2  /  ACTIVE" else "RL 2",
                 onClick = onReload2,
-                modifier = Modifier.width(80.dp).height(50.dp),
-                shape = RoundedCornerShape(8.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (reload2) Color(0xFF4CAF50) else Color(0xFF795548)
-                )
-            ) {
-                Text("RL 2", fontWeight = FontWeight.Bold)
-            }
-
-            Button(
+                modifier = Modifier.width(100.dp),
+                containerColor = if (reload2) Color(0xFF124D37) else ControllerColors.Surface2,
+                contentColor = if (reload2) ControllerColors.Success else ControllerColors.TextPrimary,
+                height = 50.dp,
+                fontSize = 11.sp,
+                accent = if (reload2) ControllerColors.Success else ControllerColors.Border
+            )
+            HudButton(
+                text = if (reload3) "RL 3  /  ACTIVE" else "RL 3",
                 onClick = onReload3,
-                modifier = Modifier.width(80.dp).height(50.dp),
-                shape = RoundedCornerShape(8.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (reload3) Color(0xFF4CAF50) else Color(0xFF795548)
-                )
-            ) {
-                Text("RL 3", fontWeight = FontWeight.Bold)
-            }
+                modifier = Modifier.width(100.dp),
+                containerColor = if (reload3) Color(0xFF124D37) else ControllerColors.Surface2,
+                contentColor = if (reload3) ControllerColors.Success else ControllerColors.TextPrimary,
+                height = 50.dp,
+                fontSize = 11.sp,
+                accent = if (reload3) ControllerColors.Success else ControllerColors.Border
+            )
         }
+
         Column(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(30.dp).offset(20.dp),
+                .padding(30.dp)
+                .offset(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
             horizontalAlignment = Alignment.End
         ) {
-            Button(
+            HudButton(
+                text = if (refill) "補充  /  ACTIVE" else "補充",
                 onClick = onRefill,
-                modifier = Modifier.width(180.dp).height(60.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (refill) {
-                        Color(0xFF4CAF50)
-                    } else {
-                        Color(0xFF2196F3)
-                    }
-                )
-            ) {
-                Text("補充", fontWeight = FontWeight.Bold, fontSize = 20.sp)
-            }
-// ボタン配置カラム内（「発射」ボタンの前後など）に追加
-            Button(
+                modifier = Modifier.width(180.dp),
+                containerColor = if (refill) Color(0xFF124D37) else ControllerColors.Surface2,
+                contentColor = if (refill) ControllerColors.Success else ControllerColors.TextPrimary,
+                height = 47.dp,
+                fontSize = 20.sp,
+                accent = if (refill) ControllerColors.Success else ControllerColors.Accent
+            )
+            HudButton(
+                text = if (firebaketu) "バケツ発射  /  ACTIVE" else "バケツ発射",
                 onClick = onfirebaketu,
-                modifier = Modifier.width(180.dp).height(60.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (firebaketu) {
-                        Color(0xFF4CAF50)
-                    } else {
-                        Color(0xFFE65100)
-                    }
-                )
-            ) {
-                Text("バケツ発射", fontWeight = FontWeight.Bold, fontSize = 20.sp)
-            }
-            Button(
+                modifier = Modifier.width(180.dp),
+                containerColor = if (firebaketu) Color(0xFF124D37) else Color(0xFF4A2A0D),
+                contentColor = if (firebaketu) ControllerColors.Success else ControllerColors.Warning,
+                height = 47.dp,
+                fontSize = 20.sp,
+                accent = ControllerColors.Warning
+            )
+            HudButton(
+                text = if (firehata) "旗発射  /  ACTIVE" else "旗発射",
                 onClick = onfirehata,
-                modifier = Modifier.width(180.dp).height(60.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (firehata) {
-                        Color(0xFF4CAF50)
-                    } else {
-                        Color(0xFFB71C1C)
-                    }
-                )
-            ) {
-                Text("旗発射", fontWeight = FontWeight.Bold, fontSize = 20.sp)
-            }
-            Button(
+                modifier = Modifier.width(180.dp),
+                containerColor = if (firehata) Color(0xFF124D37) else Color(0xFF4E171E),
+                contentColor = if (firehata) ControllerColors.Success else ControllerColors.Danger,
+                height = 47.dp,
+                fontSize = 20.sp,
+                accent = ControllerColors.Danger
+            )
+            HudButton(
+                text = if (lowGain) "LOW GAIN  /  ON" else "LOW GAIN  /  OFF",
                 onClick = onToggleLowGain,
-                modifier = Modifier
-                    .width(180.dp)
-                    .height(60.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (lowGain) {
-                        Color(0xFF4CAF50)
-                    } else {
-                        Color(0xFF607D8B)
-                    }
-                )
-            ) {
-                Text(
-                    if (lowGain) "LOW GAIN ON" else "LOW GAIN OFF",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 18.sp
-                )
-            }
-
-
+                modifier = Modifier.width(180.dp),
+                containerColor = if (lowGain) Color(0xFF124D37) else ControllerColors.Surface2,
+                contentColor = if (lowGain) ControllerColors.Success else ControllerColors.TextSecondary,
+                height = 47.dp,
+                fontSize = 17.sp,
+                accent = if (lowGain) ControllerColors.Success else ControllerColors.Border
+            )
         }
-        // RecoveryUI 内の Box の直下に追加
+
         ModeSwitchButtons(
             currentScreen = ScreenState.RECOVERY,
             onNavigate = onNavigateTo,
@@ -1721,6 +1774,7 @@ fun AdjustmentUI(
     hataTurnX: Float, hataTurnY: Float, hataTurnTheta: Float,
     baketuTurnX: Float, baketuTurnY: Float, baketuTurnTheta: Float,
     hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
+    hojuPositioningEnabled: Boolean,
     hataSpeed: Float,
     baketuSpeed: Float,
     onHataSpeedIncrease: () -> Unit,
@@ -1729,44 +1783,56 @@ fun AdjustmentUI(
     onBaketuSpeedDecrease: () -> Unit,
     onNavigateTo: (ScreenState) -> Unit,
 ) {
-
     Box(
         modifier = Modifier
             .fillMaxSize()
             .rotate(if (isFlipped) 180f else 0f)
-            .background(Color.DarkGray)
+            .background(ControllerColors.Background)
             .padding(24.dp)
     ) {
         Column(
-            modifier = Modifier.align(Alignment.TopStart).offset(150.dp),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .offset(150.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Text(
                 "ADJUSTMENT MODE",
                 fontWeight = FontWeight.Bold,
-                color = Color(0xFF9C27B0),
-                fontSize = 24.sp
+                color = ControllerColors.Accent,
+                fontSize = 24.sp,
+                letterSpacing = 2.sp
             )
 
-            // --- スピード調整領域 ---
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("SPEED ADJUSTMENT", fontWeight = FontWeight.Bold, color = Color.Cyan)
+            HudPanel(modifier = Modifier.width(430.dp), accent = ControllerColors.Accent) {
+                HudSectionTitle("SPEED ADJUSTMENT", ControllerColors.Accent)
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        "HATA SPEED: ${"%.1f".format(hataSpeed)}",
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold
+                        "HATA  ${"%.1f".format(hataSpeed)}",
+                        color = ControllerColors.TextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.width(120.dp)
                     )
-                    Button(onClick = onHataSpeedDecrease, modifier = Modifier.size(90.dp, 40.dp)) {
-                        Text("H −", fontSize = 12.sp)
-                    }
-                    Button(onClick = onHataSpeedIncrease, modifier = Modifier.size(90.dp, 40.dp)) {
-                        Text("H ＋", fontSize = 12.sp)
-                    }
+                    HudButton(
+                        text = "H −",
+                        onClick = onHataSpeedDecrease,
+                        modifier = Modifier.width(90.dp),
+                        height = 40.dp,
+                        fontSize = 12.sp,
+                        accent = ControllerColors.Border
+                    )
+                    HudButton(
+                        text = "H ＋",
+                        onClick = onHataSpeedIncrease,
+                        modifier = Modifier.width(90.dp),
+                        height = 40.dp,
+                        fontSize = 12.sp,
+                        accent = ControllerColors.Accent
+                    )
                 }
 
                 Row(
@@ -1774,35 +1840,44 @@ fun AdjustmentUI(
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        "BAKETU SPEED: ${"%.1f".format(baketuSpeed)}",
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold
+                        "BAKETU  ${"%.1f".format(baketuSpeed)}",
+                        color = ControllerColors.TextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.width(120.dp)
                     )
-                    Button(onClick = onBaketuSpeedDecrease, modifier = Modifier.size(90.dp, 40.dp)) {
-                        Text("B −", fontSize = 12.sp)
-                    }
-                    Button(onClick = onBaketuSpeedIncrease, modifier = Modifier.size(90.dp, 40.dp)) {
-                        Text("B ＋", fontSize = 12.sp)
-                    }
+                    HudButton(
+                        text = "B −",
+                        onClick = onBaketuSpeedDecrease,
+                        modifier = Modifier.width(90.dp),
+                        height = 40.dp,
+                        fontSize = 12.sp,
+                        accent = ControllerColors.Border
+                    )
+                    HudButton(
+                        text = "B ＋",
+                        onClick = onBaketuSpeedIncrease,
+                        modifier = Modifier.width(90.dp),
+                        height = 40.dp,
+                        fontSize = 12.sp,
+                        accent = ControllerColors.Warning
+                    )
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // --- Turn ターゲット選択 ＆ 値表示領域 ---
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("TURN TARGET ADJUSTMENT", fontWeight = FontWeight.Bold, color = Color.Cyan)
-
+            HudPanel(modifier = Modifier.width(430.dp), accent = ControllerColors.Warning) {
+                HudSectionTitle("TURN TARGET ADJUSTMENT", ControllerColors.Warning)
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TurnSelectButton(
                         label = "HATA",
                         selected = selectedTurnTarget == TurnTarget.HATA,
+                        enabled = !hojuPositioningEnabled,
                         onClick = { onSelectTurnTarget(TurnTarget.HATA) }
                     )
                     TurnSelectButton(
                         label = "BAKETU",
                         selected = selectedTurnTarget == TurnTarget.BAKETU,
+                        enabled = !hojuPositioningEnabled,
                         onClick = { onSelectTurnTarget(TurnTarget.BAKETU) }
                     )
                     TurnSelectButton(
@@ -1812,84 +1887,69 @@ fun AdjustmentUI(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(4.dp))
+                val currentTurnText = when (selectedTurnTarget) {
+                    TurnTarget.HATA -> "HATA   X ${"%.2f".format(hataTurnX)}   Y ${"%.2f".format(hataTurnY)}   θ ${"%.2f".format(hataTurnTheta)}"
+                    TurnTarget.BAKETU -> "BAKETU X ${"%.2f".format(baketuTurnX)}   Y ${"%.2f".format(baketuTurnY)}   θ ${"%.2f".format(baketuTurnTheta)}"
+                    TurnTarget.HOJU -> "HOJU   X ${"%.2f".format(hojuTurnX)}   Y ${"%.2f".format(hojuTurnY)}   θ ${"%.2f".format(hojuTurnTheta)}"
+                }
 
-                when (selectedTurnTarget) {
-                    TurnTarget.HATA -> Text(
-                        "HATA -> X: ${"%.2f".format(hataTurnX)}  Y: ${"%.2f".format(hataTurnY)}  θ: ${"%.2f".format(hataTurnTheta)}",
-                        color = Color.Yellow, fontSize = 16.sp, fontWeight = FontWeight.Bold
-                    )
-                    TurnTarget.BAKETU -> Text(
-                        "BAKETU -> X: ${"%.2f".format(baketuTurnX)}  Y: ${"%.2f".format(baketuTurnY)}  θ: ${"%.2f".format(baketuTurnTheta)}",
-                        color = Color.Yellow, fontSize = 16.sp, fontWeight = FontWeight.Bold
-                    )
-                    TurnTarget.HOJU -> Text(
-                        "HOJU -> X: ${"%.2f".format(hojuTurnX)}  Y: ${"%.2f".format(hojuTurnY)}  θ: ${"%.2f".format(hojuTurnTheta)}",
-                        color = Color.Yellow, fontSize = 16.sp, fontWeight = FontWeight.Bold
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(ControllerColors.Background, RoundedCornerShape(6.dp))
+                        .border(1.dp, ControllerColors.BorderAccent, RoundedCornerShape(6.dp))
+                        .padding(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        currentTurnText,
+                        color = ControllerColors.TextPrimary,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
         }
 
-
-        // AdjustmentUI 内の Box の直下に追加
         ModeSwitchButtons(
             currentScreen = ScreenState.ADJUSTMENT,
             onNavigate = onNavigateTo,
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(top = 16.dp, end = 200.dp).offset(22.dp,-25.dp)
+                .padding(top = 16.dp, end = 200.dp)
+                .offset(24.dp, -24.dp)
         )
     }
 }
+
 @Composable
 fun ModeSwitchButtons(
     currentScreen: ScreenState,
     onNavigate: (ScreenState) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val activeColor = Color(0xFFFF9800)
-    val inactiveColor = Color(0xFF03A9F4)
-
     Column(
         modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
         horizontalAlignment = Alignment.End
     ) {
-        // 通常モード
-        Button(
-            onClick = { if (currentScreen != ScreenState.CONTROLLER) onNavigate(ScreenState.CONTROLLER) },
-            modifier = Modifier.width(130.dp).height(38.dp),
-            shape = RoundedCornerShape(8.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (currentScreen == ScreenState.CONTROLLER) activeColor else inactiveColor
-            )
-        ) {
-            Text("通常モード", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = Color.White)
-        }
+        val screens = listOf(
+            ScreenState.CONTROLLER to "通常モード",
+            ScreenState.RECOVERY to "リカバリー",
+            ScreenState.ADJUSTMENT to "調整モード"
+        )
 
-        // リカバリーモード
-        Button(
-            onClick = { if (currentScreen != ScreenState.RECOVERY) onNavigate(ScreenState.RECOVERY) },
-            modifier = Modifier.width(130.dp).height(38.dp),
-            shape = RoundedCornerShape(8.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (currentScreen == ScreenState.RECOVERY) activeColor else inactiveColor
+        screens.forEach { (screen, label) ->
+            val selected = currentScreen == screen
+            HudButton(
+                text = if (selected) "●  $label" else "○  $label",
+                onClick = { if (!selected) onNavigate(screen) },
+                modifier = Modifier.width(130.dp),
+                containerColor = if (selected) Color(0xFF123D46) else ControllerColors.Surface2,
+                contentColor = if (selected) ControllerColors.Accent else ControllerColors.TextSecondary,
+                height = 38.dp,
+                fontSize = 11.sp,
+                accent = if (selected) ControllerColors.Accent else ControllerColors.Border
             )
-        ) {
-            Text("リカバリー", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = Color.White)
-        }
-
-        // 調整モード
-        Button(
-            onClick = { if (currentScreen != ScreenState.ADJUSTMENT) onNavigate(ScreenState.ADJUSTMENT) },
-            modifier = Modifier.width(130.dp).height(38.dp),
-            shape = RoundedCornerShape(8.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (currentScreen == ScreenState.ADJUSTMENT) activeColor else inactiveColor
-            )
-        ) {
-            Text("調整モード", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = Color.White)
         }
     }
 }
