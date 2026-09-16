@@ -114,8 +114,8 @@ class MainActivity : ComponentActivity() {
     private var r1 by mutableStateOf(false)
     private var r2 by mutableStateOf(false)
 
-    private var posX by mutableStateOf(4000.0)
-    private var posY by mutableStateOf(500.0)
+    private var posX by mutableStateOf(3900.0)
+    private var posY by mutableStateOf(0.0)
     private var posTheta by mutableStateOf(0.0)
     private var logList by mutableStateOf<List<String>>(emptyList())
     // turn調整値
@@ -153,13 +153,13 @@ class MainActivity : ComponentActivity() {
     // 画面状態、選択されたマップ String ("bluemap" または "redmap")、および画面反転フラグ
     private var currentScreen by mutableStateOf(ScreenState.TEAM_SELECTION)
     private var selectedMapID by mutableStateOf("bluemap")
-    private var isFlipped by mutableStateOf(false)
+    private var isFlipped by mutableStateOf(true)
 
     // turn調整対象
     private var selectedTurnTarget by mutableStateOf(TurnTarget.HATA)
 
     // turn調整の1回あたりの変化量
-    private val turnXYStep = 10f
+    private val turnXYStep = 5f
     private val turnThetaStep = 0.5f
     private var prevDpadLeft = false
     private var prevDpadRight = false
@@ -173,6 +173,58 @@ class MainActivity : ComponentActivity() {
     private var isHojuPositioningEnabled by mutableStateOf(false)
     // 速度調整の1回あたりの変化量
     private val speedStep = 0.1f
+
+    // ---- リカバリー画面の操作系ボタン 連打防止（クールダウン）設定 ----
+    // いずれかのボタンを押すと、押したボタン自身を含む操作系ボタン全てが
+    // ここで指定した秒数の間ロック（押せない状態に）される。
+    // 秒数はボタンごとに下の cooldownSeconds を変更するだけで個別に調整できる。
+    private enum class RecoveryAction(val cooldownSeconds: Float) {
+        REFILL(2.0f),       // 補充
+        FIRE_HATA(1.5f),    // 旗発射
+        FIRE_BAKETU(1.5f),  // バケツ発射
+        RELOAD1(1.0f),      // RL1
+        RELOAD2(1.0f),      // RL2
+        RELOAD3(1.0f)       // RL3
+    }
+    private val t0CooldownSeconds = 2.0f   // ロック時間(秒)。ここを変えれば秒数調整できる
+    private var t0Locked by mutableStateOf(false)  // true の間はボタンを無効化
+    private var t0LockJob: Job? = null     // ロック解除待ちのコルーチンを保持
+    // true の間はリカバリー画面の操作系ボタンが全て無効化される
+    private var recoveryActionsLocked by mutableStateOf(false)
+    private var recoveryLockJob: Job? = null
+    private fun toggleT0() {
+        if (t0Locked) return          // ロック中なら何もしない(連打防止)
+        t0 = !t0                      // 本来のON/OFF切り替え
+        t0Locked = true                // ここからロック開始
+        t0LockJob?.cancel()            // 前回のロック解除待ちが残っていたら念のため止める
+        t0LockJob = lifecycleScope.launch {
+            delay((t0CooldownSeconds * 1000).toLong())  // 2000ms待つ
+            t0Locked = false            // ロック解除
+        }
+    }
+    /**
+     * リカバリー画面の操作系ボタンが押されたときの共通処理。
+     * 対応するワンショット送信を行った後、そのボタンに設定された秒数だけ
+     * 操作系ボタン全体（自分自身を含む）をロックする。
+     * ロック中に呼ばれた場合は連打防止のため何もしない。
+     */
+    private fun triggerRecoveryAction(action: RecoveryAction) {
+        if (recoveryActionsLocked) return
+        when (action) {
+            RecoveryAction.REFILL -> pulseRefill()
+            RecoveryAction.FIRE_HATA -> pulsefirehata()
+            RecoveryAction.FIRE_BAKETU -> pulsefirebaketu()
+            RecoveryAction.RELOAD1 -> pulseReload1()
+            RecoveryAction.RELOAD2 -> pulseReload2()
+            RecoveryAction.RELOAD3 -> pulseReload3()
+        }
+        recoveryActionsLocked = true
+        recoveryLockJob?.cancel()
+        recoveryLockJob = lifecycleScope.launch {
+            delay((action.cooldownSeconds * 1000).toLong())
+            recoveryActionsLocked = false
+        }
+    }
     // クラス内、logListの定義の近くに追加
     // appendLog を以下のように変更
     private fun appendLog(msg: String) {
@@ -256,11 +308,11 @@ class MainActivity : ComponentActivity() {
 
             // L2 / R2 「押された瞬間」だけ1回調整
             if (currentL2 && !prevL2) {
-                adjustSelectedTurn(dtheta = -turnThetaStep)
+                adjustSelectedTurn(dtheta = turnThetaStep)
             }
 
             if (currentR2 && !prevR2) {
-                adjustSelectedTurn(dtheta = turnThetaStep)
+                adjustSelectedTurn(dtheta = -turnThetaStep)
             }
 
             // 前回状態を保存
@@ -394,7 +446,7 @@ class MainActivity : ComponentActivity() {
                         hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
                         selectedTurnTarget = selectedTurnTarget,
                         t0 = t0,
-                        onToggleT0 = { t0 = !t0 },
+                        onToggleT0 = { toggleT0() },
                         left = left, right = right, up = up, down = down,
                         circle = circle, square = square, cross = cross, triangle = triangle,
                         l1 = l1, l2 = l2, r1 = r1, r2 = r2,
@@ -436,7 +488,8 @@ class MainActivity : ComponentActivity() {
                         onToggleHojuPositioning = {
                             updateHojuPositioningEnabled(!isHojuPositioningEnabled)
                         },
-                        logList = logList
+                        logList = logList,
+                        t0locked = t0Locked
                     )
                 }
 
@@ -454,22 +507,23 @@ class MainActivity : ComponentActivity() {
                         left = left, right = right, up = up, down = down,
                         circle = circle, square = square, cross = cross, triangle = triangle,
                         l1 = l1, l2 = l2, r1 = r1, r2 = r2,
-                        onRefill = { pulseRefill() },
-                        onfirehata = { pulsefirehata() },
+                        onRefill = { triggerRecoveryAction(RecoveryAction.REFILL) },
+                        onfirehata = { triggerRecoveryAction(RecoveryAction.FIRE_HATA) },
                         refill = refill,
                         reload1 = reload1,
                         reload2 = reload2,
                         reload3 = reload3,
-                        onReload1 = { pulseReload1() },
-                        onReload2 = { pulseReload2() },
-                        onReload3 = { pulseReload3() },
-                        firehata = firehata,onfirebaketu = { pulsefirebaketu() }, // 追加
+                        onReload1 = { triggerRecoveryAction(RecoveryAction.RELOAD1) },
+                        onReload2 = { triggerRecoveryAction(RecoveryAction.RELOAD2) },
+                        onReload3 = { triggerRecoveryAction(RecoveryAction.RELOAD3) },
+                        firehata = firehata,onfirebaketu = { triggerRecoveryAction(RecoveryAction.FIRE_BAKETU) }, // 追加
                         firebaketu = firebaketu,             // 追加
-                        pulfirebaketu = { pulsefirebaketu() },
-                        pulrefill = { pulseRefill() },
-                        pulfirehata = { pulsefirehata() },
+                        pulfirebaketu = { triggerRecoveryAction(RecoveryAction.FIRE_BAKETU) },
+                        pulrefill = { triggerRecoveryAction(RecoveryAction.REFILL) },
+                        pulfirehata = { triggerRecoveryAction(RecoveryAction.FIRE_HATA) },
                         lowGain = lowGain,
                         onToggleLowGain = { lowGain = !lowGain },onNavigateTo = { targetScreen -> currentScreen = targetScreen },
+                        actionsLocked = recoveryActionsLocked,
                         logList = logList
                     )
                 }
@@ -1164,7 +1218,8 @@ fun ControllerUI(
     baketuSpeed: Float,
     isHojuPositioningEnabled: Boolean,
     onToggleHojuPositioning: () -> Unit,
-    logList: List<String>
+    logList: List<String>,
+    t0locked: Boolean
 ) {
     val imageBitmap = ImageBitmap.imageResource(id = R.drawable.blackarrow)
     Box(
@@ -1176,13 +1231,13 @@ fun ControllerUI(
         Box(
             modifier = Modifier
                 .size(370.dp)
-                .offset(x = 120.dp)
+                .offset(x = 120.dp,y=90.dp)
                 .background(ControllerColors.Surface, RoundedCornerShape(6.dp))
                 .border(1.dp, ControllerColors.Border, RoundedCornerShape(6.dp))
                 .graphicsLayer { scaleX = if (mapID == "redmap") -1f else 1f }
         ) {
             Image(
-                painter = painterResource(id = R.drawable.robocon_map),
+                painter = if (mapID == "redmap")painterResource(id = R.drawable.robocon_mapred) else painterResource(id = R.drawable.robocon_mapblue),
                 contentDescription = null,
                 modifier = Modifier.fillMaxSize().graphicsLayer {
                     rotationZ = 90f
@@ -1192,8 +1247,8 @@ fun ControllerUI(
             )
 
             Canvas(modifier = Modifier.fillMaxSize()) {
-                val mapWidth = 11700
-                val mapHeight = 11700
+                val mapWidth = 11000
+                val mapHeight = 11000
                 val scaleX = size.width / mapWidth
                 val scaleY = size.height / mapHeight
                 var tempPx = 0.0
@@ -1202,8 +1257,8 @@ fun ControllerUI(
                     tempPx = posX
                     tempPy = posY
                 } else {
-                    tempPx = -posX
-                    tempPy = -posY
+                    tempPx = posX
+                    tempPy = posY
                 }
 
                 val px = size.height - (tempPx * scaleX).toFloat()
@@ -1215,11 +1270,11 @@ fun ControllerUI(
                 val translateY: Float
 
                 if (mapID == "bluemap") {
-                    translateX = robotPos.y + 1140f
-                    translateY = robotPos.x - 25f
+                    translateX = robotPos.y + 1182f
+                    translateY = robotPos.x - 317f
                 } else {
-                    translateX = -robotPos.y + 1140f
-                    translateY = robotPos.x - 25f
+                    translateX = -robotPos.y + 1182f
+                    translateY = robotPos.x -317f
                 }
 
                 withTransform({
@@ -1254,7 +1309,7 @@ fun ControllerUI(
         Column(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(16.dp)
+                .padding(1.dp)
                 .width(120.dp)
         ) {
             HudPanel(
@@ -1284,7 +1339,7 @@ fun ControllerUI(
                 Box(
                     modifier = Modifier
                         .width(140.dp)
-                        .height(170.dp)
+                        .height(150.dp)
                         .background(ControllerColors.Background, RoundedCornerShape(5.dp))
                         .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
                         .padding(5.dp)
@@ -1405,6 +1460,7 @@ fun ControllerUI(
         // t0
         Button(
             onClick = onToggleT0,
+            enabled = !t0locked,
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .padding(100.dp)
@@ -1529,6 +1585,7 @@ fun RecoveryUI(
     pulfirebaketu: () -> Unit,
     pulrefill: () -> Unit,
     pulfirehata: () -> Unit,
+    actionsLocked: Boolean,
     logList: List<String>
 ) {
     val imageBitmap = ImageBitmap.imageResource(id = R.drawable.blackarrow)
@@ -1540,18 +1597,18 @@ fun RecoveryUI(
         modifier = Modifier
             .fillMaxSize()
             .rotate(if (isFlipped) 180f else 0f)
-            .background(ControllerColors.Background)
+            .background(ControllerColors.Background),
     ) {
         Box(
             modifier = Modifier
                 .size(370.dp)
-                .offset(x = 120.dp)
+                .offset(x = 120.dp,y=90.dp)
                 .background(ControllerColors.Surface, RoundedCornerShape(6.dp))
                 .border(1.dp, ControllerColors.Border, RoundedCornerShape(6.dp))
                 .graphicsLayer { scaleX = if (mapID == "redmap") -1f else 1f }
         ) {
             Image(
-                painter = painterResource(id = R.drawable.robocon_map),
+                painter = if (mapID == "redmap")painterResource(id = R.drawable.robocon_mapred) else painterResource(id = R.drawable.robocon_mapblue),
                 contentDescription = null,
                 modifier = Modifier.fillMaxSize().graphicsLayer {
                     rotationZ = 90f
@@ -1561,25 +1618,34 @@ fun RecoveryUI(
             )
 
             Canvas(modifier = Modifier.fillMaxSize()) {
-                val mapWidth = 11700
-                val mapHeight = 11700
+                val mapWidth = 11000
+                val mapHeight = 11000
                 val scaleX = size.width / mapWidth
                 val scaleY = size.height / mapHeight
-                val tempPx = if (mapID == "bluemap") posX else -posX
-                val tempPy = if (mapID == "bluemap") posY else -posY
+                var tempPx = 0.0
+                var tempPy = 0.0
+                if (mapID == "bluemap") {
+                    tempPx = posX
+                    tempPy = posY
+                } else {
+                    tempPx = posX
+                    tempPy = posY
+                }
+
                 val px = size.height - (tempPx * scaleX).toFloat()
                 val py = (-tempPy * scaleY).toFloat()
                 val robotPos = Offset(px, py)
+
                 val angleDegrees = Math.toDegrees(posTheta).toFloat()
                 val translateX: Float
                 val translateY: Float
 
                 if (mapID == "bluemap") {
-                    translateX = robotPos.y + 1140f
-                    translateY = robotPos.x - 25f
+                    translateX = robotPos.y + 1182f
+                    translateY = robotPos.x - 317f
                 } else {
-                    translateX = -robotPos.y + 1140f
-                    translateY = robotPos.x - 25f
+                    translateX = -robotPos.y + 1182f
+                    translateY = robotPos.x -317f
                 }
 
                 withTransform({
@@ -1598,7 +1664,7 @@ fun RecoveryUI(
         Column(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(16.dp)
+                .padding(1.dp)
                 .width(120.dp)
         ) {
             HudPanel(
@@ -1626,7 +1692,7 @@ fun RecoveryUI(
                 Box(
                     modifier = Modifier
                         .width(140.dp)
-                        .height(170.dp)
+                        .height(150.dp)
                         .background(ControllerColors.Background, RoundedCornerShape(5.dp))
                         .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
                         .padding(5.dp)
@@ -1677,6 +1743,7 @@ fun RecoveryUI(
                 modifier = Modifier.width(100.dp),
                 containerColor = if (reload1) Color(0xFF124D37) else ControllerColors.Surface2,
                 contentColor = if (reload1) ControllerColors.Success else ControllerColors.TextPrimary,
+                enabled = !actionsLocked,
                 height = 50.dp,
                 fontSize = 11.sp,
                 accent = if (reload1) ControllerColors.Success else ControllerColors.Border
@@ -1687,6 +1754,7 @@ fun RecoveryUI(
                 modifier = Modifier.width(100.dp),
                 containerColor = if (reload2) Color(0xFF124D37) else ControllerColors.Surface2,
                 contentColor = if (reload2) ControllerColors.Success else ControllerColors.TextPrimary,
+                enabled = !actionsLocked,
                 height = 50.dp,
                 fontSize = 11.sp,
                 accent = if (reload2) ControllerColors.Success else ControllerColors.Border
@@ -1697,6 +1765,7 @@ fun RecoveryUI(
                 modifier = Modifier.width(100.dp),
                 containerColor = if (reload3) Color(0xFF124D37) else ControllerColors.Surface2,
                 contentColor = if (reload3) ControllerColors.Success else ControllerColors.TextPrimary,
+                enabled = !actionsLocked,
                 height = 50.dp,
                 fontSize = 11.sp,
                 accent = if (reload3) ControllerColors.Success else ControllerColors.Border
@@ -1717,6 +1786,7 @@ fun RecoveryUI(
                 modifier = Modifier.width(180.dp),
                 containerColor = if (refill) Color(0xFF124D37) else ControllerColors.Surface2,
                 contentColor = if (refill) ControllerColors.Success else ControllerColors.TextPrimary,
+                enabled = !actionsLocked,
                 height = 47.dp,
                 fontSize = 20.sp,
                 accent = if (refill) ControllerColors.Success else ControllerColors.Accent
@@ -1727,6 +1797,7 @@ fun RecoveryUI(
                 modifier = Modifier.width(180.dp),
                 containerColor = if (firebaketu) Color(0xFF124D37) else Color(0xFF4A2A0D),
                 contentColor = if (firebaketu) ControllerColors.Success else ControllerColors.Warning,
+                enabled = !actionsLocked,
                 height = 47.dp,
                 fontSize = 20.sp,
                 accent = ControllerColors.Warning
@@ -1737,6 +1808,7 @@ fun RecoveryUI(
                 modifier = Modifier.width(180.dp),
                 containerColor = if (firehata) Color(0xFF124D37) else Color(0xFF4E171E),
                 contentColor = if (firehata) ControllerColors.Success else ControllerColors.Danger,
+                enabled = !actionsLocked,
                 height = 47.dp,
                 fontSize = 20.sp,
                 accent = ControllerColors.Danger
