@@ -62,12 +62,13 @@ import kotlin.math.sqrt
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-// 画面切り替え管理用のEnum
+import androidx.compose.ui.zIndex
+
+// ??????????Enum
 enum class ScreenState {
     TEAM_SELECTION,
     CONTROLLER,
-    RECOVERY,
-    ADJUSTMENT
+    RECOVERY
 }
 
 data class TargetThreshold(
@@ -80,7 +81,6 @@ data class TargetThreshold(
 
 enum class TurnTarget {
     HATA,
-    BAKETU,
     HOJU
 }
 
@@ -93,7 +93,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var address: InetAddress
     private lateinit var logSocket: DatagramSocket
 
-    // 通信用コルーチンをまとめて保持するJob（Activity破棄時のキャンセル・クローズ処理に使用）
+    // ?????????????????Job?Activity????????????????????
     private var networkJob: Job? = null
 
     private val prefs by lazy { getSharedPreferences("controller_prefs", Context.MODE_PRIVATE) }
@@ -118,13 +118,12 @@ class MainActivity : ComponentActivity() {
     private var posY by mutableStateOf(0.0)
     private var posTheta by mutableStateOf(0.0)
     private var logList by mutableStateOf<List<String>>(emptyList())
-    // turn調整値
+    // robot??????hojustate:xxxxxxx??????????????????
+    private var hojuState by mutableStateOf("")
+    // turn???
     private var hata_turnx by mutableStateOf(0.0f)
     private var hata_turny by mutableStateOf(0.0f)
     private var hata_turntheta by mutableStateOf(0.0f)
-    private var baketu_turnx by mutableStateOf(0.0f)
-    private var baketu_turny by mutableStateOf(0.0f)
-    private var baketu_turntheta by mutableStateOf(0.0f)
     private var hoju_turnx by mutableStateOf(0.0f)
     private var hoju_turny by mutableStateOf(0.0f)
     private var hoju_turntheta by mutableStateOf(0.0f)
@@ -132,81 +131,96 @@ class MainActivity : ComponentActivity() {
     // t0
     private var t0 by mutableStateOf(false)
 
-    // 通常モードで送信する列
+    // ???????????
     private var column1 by mutableStateOf("baketu")
     private var column2 by mutableStateOf("hata")
     private var column3 by mutableStateOf("hata")
 
-    // ワンショット送信用
+    // ?????????
     private var execute by mutableStateOf(false)
     private var refill by mutableStateOf(false)
     private var reload1 by mutableStateOf(false)
     private var reload2 by mutableStateOf(false)
     private var reload3 by mutableStateOf(false)
+    private var release by mutableStateOf(false)
 
     private var firehata by mutableStateOf(false)
     private var firebaketu by mutableStateOf(false)
+    private var hataLaser by mutableStateOf(false)
+    private var hojuLaser by mutableStateOf(false)
+    private var interrupt by mutableStateOf(false)
 
     private var sendTime = 0L
     private val rttList = mutableStateListOf<Long>()
 
-    // 画面状態、選択されたマップ String ("bluemap" または "redmap")、および画面反転フラグ
+    // ????????????? String ("bluemap" ??? "redmap")???????????
     private var currentScreen by mutableStateOf(ScreenState.TEAM_SELECTION)
     private var selectedMapID by mutableStateOf("bluemap")
     private var isFlipped by mutableStateOf(true)
 
-    // turn調整対象
+    // turn????
     private var selectedTurnTarget by mutableStateOf(TurnTarget.HATA)
 
-    // turn調整の1回あたりの変化量
-    private val turnXYStep = 5f
-    private val turnThetaStep = 0.5f
+    // turn???1????????
+    private val turnXYStep = 2f
+    private val turnThetaStep = 0.1f
     private var prevDpadLeft = false
     private var prevDpadRight = false
     private var prevDpadUp = false
     private var prevDpadDown = false
     private var prevL2 = false
     private var prevR2 = false
-    private var lowGain by mutableStateOf(false)
-    private var baketuSpeed by mutableStateOf(4.5f)
-    private var hataSpeed by mutableStateOf(10.2f)
-    private var isHojuPositioningEnabled by mutableStateOf(false)
-    // 速度調整の1回あたりの変化量
-    private val speedStep = 0.1f
 
-    // ---- リカバリー画面の操作系ボタン 連打防止（クールダウン）設定 ----
-    // いずれかのボタンを押すと、押したボタン自身を含む操作系ボタン全てが
-    // ここで指定した秒数の間ロック（押せない状態に）される。
-    // 秒数はボタンごとに下の cooldownSeconds を変更するだけで個別に調整できる。
+    // HATA????????????????????????????????????
+    private var hataTurnRepeatJob: Job? = null
+    private val hataTurnRepeatInitialDelayMs = 160L
+    private val hataTurnRepeatIntervalMs = 100L
+    private var lowGain by mutableStateOf(true)
+    private var baketuSpeed1 by mutableStateOf(4.5f)
+    private var hataSpeed1 by mutableStateOf(10.2f)
+    private var baketuSpeed2 by mutableStateOf(4.5f)
+    private var hataSpeed2 by mutableStateOf(10.2f)
+    private var baketuSpeed3 by mutableStateOf(4.5f)
+    private var hataSpeed3 by mutableStateOf(10.2f)
+
+    private var isHojuPositioningEnabled by mutableStateOf(false)
+    // ?????1????????
+    private val speedStep = 0.025f
+
+    // ---- ?????????????? ?????????????? ----
+    // ?????????????????????????????????
+    // ???????????????????????????
+    // ??????????? cooldownSeconds ?????????????????
     private enum class RecoveryAction(val cooldownSeconds: Float) {
-        REFILL(2.0f),       // 補充
-        FIRE_HATA(1.5f),    // 旗発射
-        FIRE_BAKETU(1.5f),  // バケツ発射
+        REFILL(2.0f),       // ??
+        FIRE_HATA(1.5f),    // ???
+        FIRE_BAKETU(1.5f),  // ?????
         RELOAD1(1.0f),      // RL1
         RELOAD2(1.0f),      // RL2
-        RELOAD3(1.0f)       // RL3
+        RELOAD3(1.0f),      // RL3
+        RELEASE(1.0f)       // RELEASE
     }
-    private val t0CooldownSeconds = 2.0f   // ロック時間(秒)。ここを変えれば秒数調整できる
-    private var t0Locked by mutableStateOf(false)  // true の間はボタンを無効化
-    private var t0LockJob: Job? = null     // ロック解除待ちのコルーチンを保持
-    // true の間はリカバリー画面の操作系ボタンが全て無効化される
+    private val t0CooldownSeconds = 2.0f   // ?????(?)???????????????
+    private var t0Locked by mutableStateOf(false)  // true ??????????
+    private var t0LockJob: Job? = null     // ????????????????
+    // true ??????????????????????????
     private var recoveryActionsLocked by mutableStateOf(false)
     private var recoveryLockJob: Job? = null
     private fun toggleT0() {
-        if (t0Locked) return          // ロック中なら何もしない(連打防止)
-        t0 = !t0                      // 本来のON/OFF切り替え
-        t0Locked = true                // ここからロック開始
-        t0LockJob?.cancel()            // 前回のロック解除待ちが残っていたら念のため止める
+        if (t0Locked) return          // ???????????(????)
+        t0 = !t0                      // ???ON/OFF????
+        t0Locked = true                // ?????????
+        t0LockJob?.cancel()            // ????????????????????????
         t0LockJob = lifecycleScope.launch {
-            delay((t0CooldownSeconds * 1000).toLong())  // 2000ms待つ
-            t0Locked = false            // ロック解除
+            delay((t0CooldownSeconds * 1000).toLong())  // 2000ms??
+            t0Locked = false            // ?????
         }
     }
     /**
-     * リカバリー画面の操作系ボタンが押されたときの共通処理。
-     * 対応するワンショット送信を行った後、そのボタンに設定された秒数だけ
-     * 操作系ボタン全体（自分自身を含む）をロックする。
-     * ロック中に呼ばれた場合は連打防止のため何もしない。
+     * ???????????????????????????
+     * ?????????????????????????????????
+     * ????????????????????????
+     * ?????????????????????????
      */
     private fun triggerRecoveryAction(action: RecoveryAction) {
         if (recoveryActionsLocked) return
@@ -217,6 +231,7 @@ class MainActivity : ComponentActivity() {
             RecoveryAction.RELOAD1 -> pulseReload1()
             RecoveryAction.RELOAD2 -> pulseReload2()
             RecoveryAction.RELOAD3 -> pulseReload3()
+            RecoveryAction.RELEASE -> pulseRelease()
         }
         recoveryActionsLocked = true
         recoveryLockJob?.cancel()
@@ -225,8 +240,8 @@ class MainActivity : ComponentActivity() {
             recoveryActionsLocked = false
         }
     }
-    // クラス内、logListの定義の近くに追加
-    // appendLog を以下のように変更
+    // ?????logList?????????
+    // appendLog ?????????
     private fun appendLog(msg: String) {
         runOnUiThread {
             val last = logList.lastOrNull()
@@ -235,7 +250,7 @@ class MainActivity : ComponentActivity() {
             }
 
             if (lastBase == msg) {
-                // 直前と同じ内容 → 件数だけ更新して置き換える
+                // ??????? ? ?????????????
                 val countMatch = Regex(""" \(x(\d+)\)$""").find(last ?: "")
                 val newCount = (countMatch?.groupValues?.get(1)?.toIntOrNull() ?: 1) + 1
                 val updated = "$msg (x$newCount)"
@@ -251,8 +266,8 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {}
     }
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        // コントローラー画面表示時のみ入力を有効化
-        if (currentScreen != ScreenState.CONTROLLER && currentScreen != ScreenState.RECOVERY && currentScreen != ScreenState.ADJUSTMENT) {
+        // ????????????????????
+        if (currentScreen != ScreenState.CONTROLLER && currentScreen != ScreenState.RECOVERY) {
             return super.onGenericMotionEvent(event)
         }
 
@@ -279,9 +294,10 @@ class MainActivity : ComponentActivity() {
             l2 = rawL2 > 0.5f
             r2 = rawR2 > 0.5f
 
-            // D-Padで選択中のturnのX/Yを調整
-            // ← X減少 / → X増加 / ↑ Y増加 / ↓ Y減少
-            // 現在のボタン状態
+            // turn?????
+            // HATA???: ?????1??????????????????????
+            // 100ms??????????????repeat job??????
+            // HOJU: ???????1????????
             val currentDpadLeft = rawHori < -0.5f
             val currentDpadRight = rawHori > 0.5f
             val currentDpadUp = rawVer < -0.5f
@@ -289,33 +305,51 @@ class MainActivity : ComponentActivity() {
             val currentL2 = rawL2 > 0.5f
             val currentR2 = rawR2 > 0.5f
 
-            // D-Pad 「押された瞬間」だけ1回調整
-            if (currentDpadLeft && !prevDpadLeft) {
-                adjustSelectedTurn(dx = -turnXYStep)
+            if (selectedTurnTarget == TurnTarget.HATA) {
+                // ?????????????1????????????Job?????
+                val pressedNow = currentDpadLeft || currentDpadRight || currentDpadUp ||
+                        currentDpadDown || currentL2 || currentR2
+                val wasPressed = prevDpadLeft || prevDpadRight || prevDpadUp ||
+                        prevDpadDown || prevL2 || prevR2
+
+                if (pressedNow && !wasPressed) {
+                    adjustHataTurnOnce(
+                        currentDpadLeft, currentDpadRight,
+                        currentDpadUp, currentDpadDown,
+                        currentL2, currentR2
+                    )
+                }
+
+                if (pressedNow) {
+                    startHataTurnRepeat()
+                } else {
+                    stopHataTurnRepeat()
+                }
+            } else {
+                // HOJU???????????????1????
+                stopHataTurnRepeat()
+
+                if (currentDpadLeft && !prevDpadLeft) {
+                    adjustSelectedTurn(dx = -turnXYStep)
+                }
+                if (currentDpadRight && !prevDpadRight) {
+                    adjustSelectedTurn(dx = turnXYStep)
+                }
+                if (currentDpadUp && !prevDpadUp) {
+                    adjustSelectedTurn(dy = turnXYStep)
+                }
+                if (currentDpadDown && !prevDpadDown) {
+                    adjustSelectedTurn(dy = -turnXYStep)
+                }
+                if (currentL2 && !prevL2) {
+                    adjustSelectedTurn(dtheta = turnThetaStep)
+                }
+                if (currentR2 && !prevR2) {
+                    adjustSelectedTurn(dtheta = -turnThetaStep)
+                }
             }
 
-            if (currentDpadRight && !prevDpadRight) {
-                adjustSelectedTurn(dx = turnXYStep)
-            }
-
-            if (currentDpadUp && !prevDpadUp) {
-                adjustSelectedTurn(dy = turnXYStep)
-            }
-
-            if (currentDpadDown && !prevDpadDown) {
-                adjustSelectedTurn(dy = -turnXYStep)
-            }
-
-            // L2 / R2 「押された瞬間」だけ1回調整
-            if (currentL2 && !prevL2) {
-                adjustSelectedTurn(dtheta = turnThetaStep)
-            }
-
-            if (currentR2 && !prevR2) {
-                adjustSelectedTurn(dtheta = -turnThetaStep)
-            }
-
-            // 前回状態を保存
+            // ???????
             prevDpadLeft = currentDpadLeft
             prevDpadRight = currentDpadRight
             prevDpadUp = currentDpadUp
@@ -327,13 +361,71 @@ class MainActivity : ComponentActivity() {
         return super.onGenericMotionEvent(event)
     }
 
+    /** HATA turn??????1???????? */
+    private fun adjustHataTurnOnce(
+        dpadLeft: Boolean,
+        dpadRight: Boolean,
+        dpadUp: Boolean,
+        dpadDown: Boolean,
+        l2Pressed: Boolean,
+        r2Pressed: Boolean
+    ) {
+        if (dpadLeft) adjustSelectedTurn(dx = -turnXYStep)
+        if (dpadRight) adjustSelectedTurn(dx = turnXYStep)
+        if (dpadUp) adjustSelectedTurn(dy = turnXYStep)
+        if (dpadDown) adjustSelectedTurn(dy = -turnXYStep)
+        if (l2Pressed) adjustSelectedTurn(dtheta = turnThetaStep)
+        if (r2Pressed) adjustSelectedTurn(dtheta = -turnThetaStep)
+    }
+
+    /**
+     * HATA turn??????MotionEvent?repeat???????????
+     * ???????1? + ??????1?????????????????
+     * ???????100ms?????????
+     */
+    private fun startHataTurnRepeat() {
+        if (hataTurnRepeatJob?.isActive == true) return
+
+        hataTurnRepeatJob = lifecycleScope.launch {
+            // ??????300ms?1??????????????????????
+            delay(hataTurnRepeatInitialDelayMs)
+
+            while (isActive) {
+                delay(hataTurnRepeatIntervalMs)
+
+                if (selectedTurnTarget != TurnTarget.HATA) break
+
+                val dpadLeft = left
+                val dpadRight = right
+                val dpadUp = up
+                val dpadDown = down
+                val l2Pressed = l2
+                val r2Pressed = r2
+
+                if (!dpadLeft && !dpadRight && !dpadUp &&
+                    !dpadDown && !l2Pressed && !r2Pressed) {
+                    break
+                }
+
+                adjustHataTurnOnce(
+                    dpadLeft, dpadRight, dpadUp, dpadDown,
+                    l2Pressed, r2Pressed
+                )
+            }
+        }
+    }
+
+    private fun stopHataTurnRepeat() {
+        hataTurnRepeatJob?.cancel()
+        hataTurnRepeatJob = null
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if ((currentScreen == ScreenState.CONTROLLER || currentScreen == ScreenState.RECOVERY ||
-                    currentScreen == ScreenState.ADJUSTMENT) &&
+        if ((currentScreen == ScreenState.CONTROLLER || currentScreen == ScreenState.RECOVERY) &&
             event.source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
         ) {
             when (keyCode) {
-                // PSボタンでTurn調整対象を HATA -> BAKETU -> HOJU -> HATA の順に切り替える
+                // PS????Turn????? HATA -> HOJU -> HATA ????????
                 KeyEvent.KEYCODE_BUTTON_MODE -> {
                     if (event.repeatCount == 0) {
                         cycleTurnTarget()
@@ -352,8 +444,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if ((currentScreen == ScreenState.CONTROLLER || currentScreen == ScreenState.RECOVERY ||
-                    currentScreen == ScreenState.ADJUSTMENT) &&
+        if ((currentScreen == ScreenState.CONTROLLER || currentScreen == ScreenState.RECOVERY) &&
             event.source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
         ) {
             when (keyCode) {
@@ -389,20 +480,21 @@ class MainActivity : ComponentActivity() {
         hata_turnx = prefs.getFloat("hata_turnx", 0.0f)
         hata_turny = prefs.getFloat("hata_turny", 0.0f)
         hata_turntheta = prefs.getFloat("hata_turntheta", 0.0f)
-        baketu_turnx = prefs.getFloat("baketu_turnx", 0.0f)
-        baketu_turny = prefs.getFloat("baketu_turny", 0.0f)
-        baketu_turntheta = prefs.getFloat("baketu_turntheta", 0.0f)
         hoju_turnx = prefs.getFloat("hoju_turnx", 0.0f)
         hoju_turny = prefs.getFloat("hoju_turny", 0.0f)
         hoju_turntheta = prefs.getFloat("hoju_turntheta", 0.0f)
-        hataSpeed = prefs.getFloat("hata_speed", 10.2f)
-        baketuSpeed = prefs.getFloat("baketu_speed", 4.5f)
+        hataSpeed1 = prefs.getFloat("hata_speed1", 10.2f)
+        baketuSpeed1 = prefs.getFloat("baketu_speed1", 4.5f)
+        hataSpeed2 = prefs.getFloat("hata_speed2", 10.2f)
+        baketuSpeed2 = prefs.getFloat("baketu_speed2", 4.5f)
+        hataSpeed3 = prefs.getFloat("hata_speed3", 10.2f)
+        baketuSpeed3 = prefs.getFloat("baketu_speed3", 4.5f)
         hideSystemUI()
         startLockTaskMode()
 
-        // --- 通信処理 ---
-        // ソケット初期化に失敗した場合は一定回数再試行し、それでも失敗した場合は
-        // アプリ自身を再起動して初期化をやり直す。
+        // --- ???? ---
+        // ???????????????????????????????????
+        // ????????????????????
         networkJob = lifecycleScope.launch(Dispatchers.IO) {
             if (!initializeNetworkWithRetry()) {
                 appendLog("NETWORK INIT FAILED: restarting app")
@@ -412,7 +504,7 @@ class MainActivity : ComponentActivity() {
                 return@launch
             }
 
-            // 初期化完了後に、送信・受信・ログ受信を開始する。
+            // ????????????????????????
             launch { sendLoop() }
             launch { receiveLoop() }
             launch { logReceiveLoop() }
@@ -442,11 +534,12 @@ class MainActivity : ComponentActivity() {
                         currentVy = if (lowGain) vx / 2f else vx,
                         currentW = if (lowGain) w / 2f else w,
                         hataTurnX = hata_turnx, hataTurnY = hata_turny, hataTurnTheta = hata_turntheta,
-                        baketuTurnX = baketu_turnx, baketuTurnY = baketu_turny, baketuTurnTheta = baketu_turntheta,
                         hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
                         selectedTurnTarget = selectedTurnTarget,
                         t0 = t0,
                         onToggleT0 = { toggleT0() },
+                        interrupt = interrupt,
+                        onInterrupt = { pulseInterrupt() },
                         left = left, right = right, up = up, down = down,
                         circle = circle, square = square, cross = cross, triangle = triangle,
                         l1 = l1, l2 = l2, r1 = r1, r2 = r2,
@@ -479,16 +572,33 @@ class MainActivity : ComponentActivity() {
                         },
                         onExecute = { pulseExecute() },
                         onEnterRecovery = { currentScreen = ScreenState.RECOVERY },
-                        onEnterAdjustment = { currentScreen = ScreenState.ADJUSTMENT },
                         execute = execute,
                         pulexecute = { pulseExecute() },
-                        hataSpeed = hataSpeed,
-                        baketuSpeed = baketuSpeed,onNavigateTo = { targetScreen -> currentScreen = targetScreen },
+                        hataSpeed1 = hataSpeed1,
+                        baketuSpeed1 = baketuSpeed1,
+                        hataSpeed2 = hataSpeed2,
+                        baketuSpeed2 = baketuSpeed2,
+                        hataSpeed3 = hataSpeed3,
+                        baketuSpeed3 = baketuSpeed3,
+                        onHataSpeed1Increase = { hataSpeed1 = (hataSpeed1 + speedStep).coerceAtMost(11.2f) },
+                        onHataSpeed1Decrease = { hataSpeed1 = (hataSpeed1 - speedStep).coerceAtLeast(9.0f) },
+                        onBaketuSpeed1Increase = { baketuSpeed1 = (baketuSpeed1 + speedStep).coerceAtMost(5.0f) },
+                        onBaketuSpeed1Decrease = { baketuSpeed1 = (baketuSpeed1 - speedStep).coerceAtLeast(4.0f) },
+                        onHataSpeed2Increase = { hataSpeed2 = (hataSpeed2 + speedStep).coerceAtMost(11.2f) },
+                        onHataSpeed2Decrease = { hataSpeed2 = (hataSpeed2 - speedStep).coerceAtLeast(9.0f) },
+                        onBaketuSpeed2Increase = { baketuSpeed2 = (baketuSpeed2 + speedStep).coerceAtMost(5.0f) },
+                        onBaketuSpeed2Decrease = { baketuSpeed2 = (baketuSpeed2 - speedStep).coerceAtLeast(4.0f) },
+                        onHataSpeed3Increase = { hataSpeed3 = (hataSpeed3 + speedStep).coerceAtMost(11.2f) },
+                        onHataSpeed3Decrease = { hataSpeed3 = (hataSpeed3 - speedStep).coerceAtLeast(9.0f) },
+                        onBaketuSpeed3Increase = { baketuSpeed3 = (baketuSpeed3 + speedStep).coerceAtMost(5.0f) },
+                        onBaketuSpeed3Decrease = { baketuSpeed3 = (baketuSpeed3 - speedStep).coerceAtLeast(4.0f) },
+                        onNavigateTo = { targetScreen -> currentScreen = targetScreen },
                         isHojuPositioningEnabled = isHojuPositioningEnabled,
                         onToggleHojuPositioning = {
                             updateHojuPositioningEnabled(!isHojuPositioningEnabled)
                         },
                         logList = logList,
+                        hojuState = hojuState,
                         t0locked = t0Locked
                     )
                 }
@@ -516,54 +626,48 @@ class MainActivity : ComponentActivity() {
                         onReload1 = { triggerRecoveryAction(RecoveryAction.RELOAD1) },
                         onReload2 = { triggerRecoveryAction(RecoveryAction.RELOAD2) },
                         onReload3 = { triggerRecoveryAction(RecoveryAction.RELOAD3) },
-                        firehata = firehata,onfirebaketu = { triggerRecoveryAction(RecoveryAction.FIRE_BAKETU) }, // 追加
-                        firebaketu = firebaketu,             // 追加
+                        release = release,
+                        onRelease = { triggerRecoveryAction(RecoveryAction.RELEASE) },
+                        firehata = firehata,onfirebaketu = { triggerRecoveryAction(RecoveryAction.FIRE_BAKETU) }, // ??
+                        firebaketu = firebaketu,             // ??
                         pulfirebaketu = { triggerRecoveryAction(RecoveryAction.FIRE_BAKETU) },
                         pulrefill = { triggerRecoveryAction(RecoveryAction.REFILL) },
                         pulfirehata = { triggerRecoveryAction(RecoveryAction.FIRE_HATA) },
+                        hataLaser = hataLaser,
+                        onHataLaser = { hataLaser = !hataLaser },
+                        hojuLaser = hojuLaser,
+                        onHojuLaser = { hojuLaser = !hojuLaser },
                         lowGain = lowGain,
                         onToggleLowGain = { lowGain = !lowGain },onNavigateTo = { targetScreen -> currentScreen = targetScreen },
                         actionsLocked = recoveryActionsLocked,
-                        logList = logList
+                        logList = logList,
+                        baketuSpeed1 = baketuSpeed1,
+                        baketuSpeed2 = baketuSpeed2,
+                        baketuSpeed3 = baketuSpeed3,
+                        hataSpeed1 = hataSpeed1,
+                        hataSpeed2 = hataSpeed2,
+                        hataSpeed3 = hataSpeed3,
+                        onHataSpeed1Increase = { hataSpeed1 = (hataSpeed1 + speedStep).coerceAtMost(11.2f) },
+                        onHataSpeed1Decrease = { hataSpeed1 = (hataSpeed1 - speedStep).coerceAtLeast(9.0f) },
+                        onBaketuSpeed1Increase = { baketuSpeed1 = (baketuSpeed1 + speedStep).coerceAtMost(5.0f) },
+                        onBaketuSpeed1Decrease = { baketuSpeed1 = (baketuSpeed1 - speedStep).coerceAtLeast(4.0f) },
+                        onHataSpeed2Increase = { hataSpeed2 = (hataSpeed2 + speedStep).coerceAtMost(11.2f) },
+                        onHataSpeed2Decrease = { hataSpeed2 = (hataSpeed2 - speedStep).coerceAtLeast(9.0f) },
+                        onBaketuSpeed2Increase = { baketuSpeed2 = (baketuSpeed2 + speedStep).coerceAtMost(5.0f) },
+                        onBaketuSpeed2Decrease = { baketuSpeed2 = (baketuSpeed2 - speedStep).coerceAtLeast(4.0f) },
+                        onHataSpeed3Increase = { hataSpeed3 = (hataSpeed3 + speedStep).coerceAtMost(11.2f) },
+                        onHataSpeed3Decrease = { hataSpeed3 = (hataSpeed3 - speedStep).coerceAtLeast(9.0f) },
+                        onBaketuSpeed3Increase = { baketuSpeed3 = (baketuSpeed3 + speedStep).coerceAtMost(5.0f) },
+                        onBaketuSpeed3Decrease = { baketuSpeed3 = (baketuSpeed3 - speedStep).coerceAtLeast(4.0f) },
                     )
                 }
 
-                ScreenState.ADJUSTMENT -> {
-                    AdjustmentUI(
-                        isFlipped = isFlipped,
-                        selectedTurnTarget = selectedTurnTarget,
-                        onSelectTurnTarget = { target ->
-                            if (!isHojuPositioningEnabled || target == TurnTarget.HOJU) {
-                                selectedTurnTarget = target
-                            }
-                        },
-                        hataTurnX = hata_turnx, hataTurnY = hata_turny, hataTurnTheta = hata_turntheta,
-                        baketuTurnX = baketu_turnx, baketuTurnY = baketu_turny, baketuTurnTheta = baketu_turntheta,
-                        hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
-                        hojuPositioningEnabled = isHojuPositioningEnabled,
-                        hataSpeed = hataSpeed,
-                        baketuSpeed = baketuSpeed,
-                        onHataSpeedIncrease = {
-                            hataSpeed = (hataSpeed + speedStep).coerceAtMost(10.2f)
-                        },
-                        onHataSpeedDecrease = {
-                            hataSpeed = (hataSpeed - speedStep).coerceAtLeast(9.0f)
-                        },
-                        onBaketuSpeedIncrease = {
-                            baketuSpeed = (baketuSpeed + speedStep).coerceAtMost(5.0f)
-                        },
-                        onBaketuSpeedDecrease = {
-                            baketuSpeed = (baketuSpeed - speedStep).coerceAtLeast(4.0f)
-                        },
-                        onNavigateTo = { targetScreen -> currentScreen = targetScreen }
-                    )
-                }
             }
         }
     }
 
     /**
-     * 通信ソケットの初期化を行う。部分的に初期化できた場合も必ず後始末してから再試行する。
+     * ??????????????????????????????????????????
      */
     private suspend fun initializeNetworkWithRetry(maxRetries: Int = 5): Boolean {
         repeat(maxRetries) { attempt ->
@@ -591,7 +695,7 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                 }
 
-                // 既存のソケットが残っている場合も閉じて、次の試行に備える。
+                // ?????????????????????????????
                 closeSockets()
 
                 appendLog(
@@ -610,9 +714,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 現在のActivityを終了し、ランチャーActivityを1秒後に再起動する。
-     * onPause() でプロセスを終了する既存実装とも競合しないよう、
-     * 再起動予約を行ってからタスクとプロセスを終了する。
+     * ???Activity??????????Activity?1?????????
+     * onPause() ????????????????????????
+     * ?????????????????????????
      */
     private fun restartApp() {
         try {
@@ -653,30 +757,25 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 送信ループ。10msごとに現在の操作状態をUDPで送信する。
-     * lifecycleScope.launch(Dispatchers.IO) の子コルーチンとして起動される想定。
+     * ??????10ms???????????UDP??????
+     * lifecycleScope.launch(Dispatchers.IO) ??????????????????
      */
     private suspend fun CoroutineScope.sendLoop() {
         while (isActive) {
-            if (currentScreen == ScreenState.CONTROLLER || currentScreen == ScreenState.RECOVERY ||
-                currentScreen == ScreenState.ADJUSTMENT
-            ) {
+            if (currentScreen == ScreenState.CONTROLLER || currentScreen == ScreenState.RECOVERY) {
                 send(
                     selectedMapID,
                     if (lowGain) vy / 2f else vy,
                     if (lowGain) vx / 2f else vx,
-                    if (lowGain) w / 2f else w, hataSpeed,
-                    baketuSpeed,
+                    if (lowGain) w / 2f else w,
+                    hataSpeed1, baketuSpeed1,
+                    hataSpeed2, baketuSpeed2,
+                    hataSpeed3, baketuSpeed3,
                     hata_turnx, hata_turny, hata_turntheta,
                     hoju_turnx, hoju_turny, hoju_turntheta,
-                    baketu_turnx, baketu_turny, baketu_turntheta,
-                    mode = when (currentScreen) {
-                        ScreenState.RECOVERY -> "recovery"
-                        ScreenState.ADJUSTMENT -> "adjustment"
-                        else -> "normal"
-                    },
+                    mode = if (currentScreen == ScreenState.RECOVERY) "recovery" else "normal",
                     column1, column2, column3,
-                    execute, refill, reload1, reload2, reload3, firehata, firebaketu, t0, isHojuPositioningEnabled,
+                    execute, refill, reload1, reload2, reload3, release, firehata, firebaketu, hataLaser, hojuLaser, t0, interrupt, isHojuPositioningEnabled,
                     left, right, up, down,
                     circle, triangle, square, cross,
                     l1, l2, r1, r2
@@ -687,14 +786,14 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 受信ループ。ロボットから送られてくる自己位置情報を受信する。
+     * ??????????????????????????????
      */
     private suspend fun CoroutineScope.receiveLoop() {
         val buf = ByteArray(1024)
         while (isActive) {
             try {
                 val packet = DatagramPacket(buf, buf.size)
-                socket.receive(packet) // ブロッキングI/O（Dispatchers.IOで実行される）
+                socket.receive(packet) // ??????I/O?Dispatchers.IO???????
 
                 val jsonString = String(packet.data, 0, packet.length)
                 try {
@@ -710,7 +809,7 @@ class MainActivity : ComponentActivity() {
                 if (rttList.size > 50) rttList.removeAt(0)
                 rttList.add(rtt)
             } catch (e: Exception) {
-                // close()によるSocketExceptionはActivity終了時の正常な停止なのでログを出さない
+                // close()???SocketException?Activity???????????????????
                 if (isActive) {
                     appendLog("RECV ERROR: ${e.javaClass.simpleName} ${e.message}")
                 }
@@ -719,27 +818,41 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * ログ受信ループ。ロボット側から送られてくるデバッグログを受信する。
+     * ?????????????????????????????????
      */
     private suspend fun CoroutineScope.logReceiveLoop() {
         val buf = ByteArray(1024)
         while (isActive) {
             try {
                 val packet = DatagramPacket(buf, buf.size)
-                logSocket.receive(packet) // ブロッキングI/O（Dispatchers.IOで実行される）
+                logSocket.receive(packet) // ??????I/O?Dispatchers.IO???????
 
                 val jsonString = String(packet.data, 0, packet.length)
                 val json = JSONObject(jsonString)
                 val receivedLog = json.optString("log", "")
 
                 if (receivedLog.isNotBlank() && !receivedLog.equals("none", ignoreCase = true)) {
-                    val newLines = receivedLog
-                        .split("\n")
-                        .filter { it.isNotBlank() && !it.equals("none", ignoreCase = true) }
+                    val normalLines = mutableListOf<String>()
+                    var latestHojuState: String? = null
 
-                    if (newLines.isNotEmpty()) {
+                    receivedLog.split("\n")
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() && !it.equals("none", ignoreCase = true) }
+                        .forEach { line ->
+                            if (line.startsWith("hojustate:")) {
+                                // hojustate???UI????SYSTEM LOG???????
+                                latestHojuState = line
+                            } else {
+                                normalLines += line
+                            }
+                        }
+
+                    if (latestHojuState != null || normalLines.isNotEmpty()) {
                         runOnUiThread {
-                            logList = (logList + newLines).takeLast(50)
+                            latestHojuState?.let { hojuState = it }
+                            if (normalLines.isNotEmpty()) {
+                                logList = (logList + normalLines).takeLast(50)
+                            }
                         }
                     }
                 }
@@ -755,23 +868,29 @@ class MainActivity : ComponentActivity() {
         isHojuPositioningEnabled = enabled
         if (enabled) {
             selectedTurnTarget = TurnTarget.HOJU
-            appendLog("TURN TARGET: HOJU (Hoju positioning ON)")
         }
     }
 
     private fun cycleTurnTarget() {
         if (isHojuPositioningEnabled) {
             selectedTurnTarget = TurnTarget.HOJU
-            appendLog("TURN TARGET LOCKED: HOJU")
+            stopHataTurnRepeat()
             return
         }
 
         selectedTurnTarget = when (selectedTurnTarget) {
-            TurnTarget.HATA -> TurnTarget.BAKETU
-            TurnTarget.BAKETU -> TurnTarget.HOJU
+            TurnTarget.HATA -> TurnTarget.HOJU
             TurnTarget.HOJU -> TurnTarget.HATA
         }
-        appendLog("TURN TARGET: ${selectedTurnTarget.displayName()}")
+
+        if (selectedTurnTarget == TurnTarget.HATA &&
+            (left || right || up || down || l2 || r2)
+        ) {
+            startHataTurnRepeat()
+        } else if (selectedTurnTarget != TurnTarget.HATA) {
+            stopHataTurnRepeat()
+        }
+
     }
 
     private fun adjustSelectedTurn(
@@ -784,11 +903,6 @@ class MainActivity : ComponentActivity() {
                 hata_turnx += dx
                 hata_turny += dy
                 hata_turntheta += dtheta
-            }
-            TurnTarget.BAKETU -> {
-                baketu_turnx += dx
-                baketu_turny += dy
-                baketu_turntheta += dtheta
             }
             TurnTarget.HOJU -> {
                 hoju_turnx += dx
@@ -820,6 +934,10 @@ class MainActivity : ComponentActivity() {
 
     private fun pulseExecute() {
         if (execute) return
+        selectedTurnTarget = TurnTarget.HATA
+        if (left || right || up || down || l2 || r2) {
+            startHataTurnRepeat()
+        }
         execute = true
         lifecycleScope.launch {
             delay(150)
@@ -852,6 +970,15 @@ class MainActivity : ComponentActivity() {
             firebaketu = false
         }
     }
+
+    private fun pulseInterrupt() {
+        if (interrupt) return
+        interrupt = true
+        lifecycleScope.launch {
+            delay(150)
+            interrupt = false
+        }
+    }
     private fun pulseReload1() {
         if (reload1) return
         reload1 = true
@@ -878,6 +1005,15 @@ class MainActivity : ComponentActivity() {
             reload3 = false
         }
     }
+
+    private fun pulseRelease() {
+        if (release) return
+        release = true
+        lifecycleScope.launch {
+            delay(150)
+            release = false
+        }
+    }
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
@@ -902,21 +1038,22 @@ class MainActivity : ComponentActivity() {
 
     private fun send(
         mapId: String,
-        vx: Float, vy: Float, w: Float, hataSpeed: Float,
-        baketuSpeed: Float,
+        vx: Float, vy: Float, w: Float,
+        hataSpeed1: Float, baketuSpeed1: Float,
+        hataSpeed2: Float, baketuSpeed2: Float,
+        hataSpeed3: Float, baketuSpeed3: Float,
         hataTurnX: Float, hataTurnY: Float, hataTurnTheta: Float,
         hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
-        baketuTurnX: Float, baketuTurnY: Float, baketuTurnTheta: Float,
         mode: String,
         column1: String, column2: String, column3: String,
-        execute: Boolean, refill: Boolean, reload1: Boolean, reload2: Boolean, reload3: Boolean,firehata: Boolean,firebaketu: Boolean, t0: Boolean,
+        execute: Boolean, refill: Boolean, reload1: Boolean, reload2: Boolean, reload3: Boolean, release: Boolean, firehata: Boolean, firebaketu: Boolean, hataLaser: Boolean, hojuLaser: Boolean, t0: Boolean, interrupt: Boolean,
         isHojuPositioningEnabled: Boolean,
         left: Boolean, right: Boolean, up: Boolean, down: Boolean,
         circle: Boolean, triangle: Boolean, square: Boolean, cross: Boolean,
         l1: Boolean, l2: Boolean, r1: Boolean, r2: Boolean
     ) {
         try {
-            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed":$hataSpeed,"baketu_speed":$baketuSpeed,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"mode":"$mode","column1":"$column1","column2":"$column2","column3":"$column3","execute":$execute,"refill":$refill,"reload1":$reload1,"reload2":$reload2,"reload3":$reload3,"firehata":$firehata,"firebaketu":$firebaketu,"t0":$t0,"HojuPosition":$isHojuPositioningEnabled,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2}"""
+            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed1":$hataSpeed1,"baketu_speed1":$baketuSpeed1,"hata_speed2":$hataSpeed2,"baketu_speed2":$baketuSpeed2,"hata_speed3":$hataSpeed3,"baketu_speed3":$baketuSpeed3,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"mode":"$mode","column1":"$column1","column2":"$column2","column3":"$column3","execute":$execute,"refill":$refill,"reload1":$reload1,"reload2":$reload2,"reload3":$reload3,"release":$release,"firehata":$firehata,"firebaketu":$firebaketu,"hatalaser":$hataLaser,"hojulaser":$hojuLaser,"t0":$t0,"interrupt":$interrupt,"HojuPosition":$isHojuPositioningEnabled,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2}"""
             val buf = msg.toByteArray()
             val packet = DatagramPacket(buf, buf.size, address, port)
             sendTime = System.nanoTime()
@@ -927,10 +1064,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * ソケットを安全にクローズする。DatagramSocket#close()は複数回呼んでも安全なため、
-     * onPause() / onDestroy() のどちらから呼ばれても問題ない。
-     * close()すると受信ループがブロックしているsocket.receive()が即座に
-     * SocketExceptionを送出して抜けるため、スレッド（コルーチン）を安全に終了できる。
+     * ???????????????DatagramSocket#close()??????????????
+     * onPause() / onDestroy() ????????????????
+     * close()?????????????????socket.receive()????
+     * SocketException????????????????????????????????
      */
     private fun closeSockets() {
         try {
@@ -946,7 +1083,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        // Activity破棄時：通信用コルーチンをキャンセルし、ソケットを確実にクローズする
+        // Activity????turn????????????????????????????????
+        stopHataTurnRepeat()
         networkJob?.cancel()
         closeSockets()
         super.onDestroy()
@@ -954,21 +1092,22 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        stopHataTurnRepeat()
         prefs.edit()
             .putFloat("hata_turnx", hata_turnx)
             .putFloat("hata_turny", hata_turny)
             .putFloat("hata_turntheta", hata_turntheta)
-            .putFloat("baketu_turnx", baketu_turnx)
-            .putFloat("baketu_turny", baketu_turny)
-            .putFloat("baketu_turntheta", baketu_turntheta)
             .putFloat("hoju_turnx", hoju_turnx)
             .putFloat("hoju_turny", hoju_turny)
             .putFloat("hoju_turntheta", hoju_turntheta)
-
-            .putFloat("hata_speed", hataSpeed)
-            .putFloat("baketu_speed", baketuSpeed)
+            .putFloat("hata_speed1", hataSpeed1)
+            .putFloat("baketu_speed1", baketuSpeed1)
+            .putFloat("hata_speed2", hataSpeed2)
+            .putFloat("baketu_speed2", baketuSpeed2)
+            .putFloat("hata_speed3", hataSpeed3)
+            .putFloat("baketu_speed3", baketuSpeed3)
             .commit()
-        // アプリ終了前に通信用コルーチンを停止し、ソケットを安全にクローズする
+        // ??????????????????????????????????
         networkJob?.cancel()
         closeSockets()
         finishAndRemoveTask()
@@ -980,7 +1119,7 @@ class MainActivity : ComponentActivity() {
  * ============================================================
  * UI THEME
  * ============================================================
- * 配置・操作系は維持し、色・階層・余白・表示の見せ方を統一する。
+ * ???????????????????????????????
  */
 private object ControllerColors {
     val Background = Color(0xFF0B0F12)
@@ -1098,7 +1237,49 @@ private fun HudButton(
 }
 
 /**
- * チーム（赤・青）選択用UI画面
+ * ??????1????? + ??? + ?/?????
+ */
+@Composable
+private fun SpeedAdjustRow(
+    label: String,
+    value: Float,
+    onIncrease: () -> Unit,
+    onDecrease: () -> Unit,
+    accent: Color = ControllerColors.Accent
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(
+            text = "$label ${"%.3f".format(value)}",
+            color = ControllerColors.TextPrimary,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.weight(1f)
+        )
+        HudButton(
+            text = "?",
+            onClick = onDecrease,
+            modifier = Modifier.width(40.dp),
+            height = 36.dp,
+            fontSize = 16.sp,
+            accent = ControllerColors.Border
+        )
+        HudButton(
+            text = "?",
+            onClick = onIncrease,
+            modifier = Modifier.width(40.dp),
+            height = 36.dp,
+            fontSize = 16.sp,
+            accent = accent
+        )
+    }
+}
+
+/**
+ * ???????????UI??
  */
 @Composable
 fun TeamSelectionScreen(
@@ -1170,7 +1351,7 @@ fun TeamSelectionScreen(
             }
 
             HudButton(
-                text = if (isFlipped) "FLIPPED  /  180°" else "ROTATE SCREEN  /  180°",
+                text = if (isFlipped) "FLIPPED  /  180�" else "ROTATE SCREEN  /  180�",
                 onClick = onToggleFlip,
                 modifier = Modifier.width(220.dp),
                 containerColor = if (isFlipped) Color(0xFF5A431B) else ControllerColors.Surface2,
@@ -1194,11 +1375,12 @@ fun ControllerUI(
     currentVy: Float,
     currentW: Float,
     hataTurnX: Float, hataTurnY: Float, hataTurnTheta: Float,
-    baketuTurnX: Float, baketuTurnY: Float, baketuTurnTheta: Float,
     hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
     selectedTurnTarget: TurnTarget,
     t0: Boolean,
     onToggleT0: () -> Unit,
+    interrupt: Boolean,
+    onInterrupt: () -> Unit,
     left: Boolean, right: Boolean, up: Boolean, down: Boolean,
     circle: Boolean, square: Boolean, cross: Boolean, triangle: Boolean,
     l1: Boolean, l2: Boolean, r1: Boolean, r2: Boolean,
@@ -1211,14 +1393,30 @@ fun ControllerUI(
     onExecute: () -> Unit,
     onNavigateTo: (ScreenState) -> Unit,
     onEnterRecovery: () -> Unit,
-    onEnterAdjustment: () -> Unit,
     execute: Boolean,
     pulexecute: () -> Unit,
-    hataSpeed: Float,
-    baketuSpeed: Float,
+    hataSpeed1: Float,
+    baketuSpeed1: Float,
+    hataSpeed2: Float,
+    baketuSpeed2: Float,
+    hataSpeed3: Float,
+    baketuSpeed3: Float,
+    onHataSpeed1Increase: () -> Unit,
+    onHataSpeed1Decrease: () -> Unit,
+    onBaketuSpeed1Increase: () -> Unit,
+    onBaketuSpeed1Decrease: () -> Unit,
+    onHataSpeed2Increase: () -> Unit,
+    onHataSpeed2Decrease: () -> Unit,
+    onBaketuSpeed2Increase: () -> Unit,
+    onBaketuSpeed2Decrease: () -> Unit,
+    onHataSpeed3Increase: () -> Unit,
+    onHataSpeed3Decrease: () -> Unit,
+    onBaketuSpeed3Increase: () -> Unit,
+    onBaketuSpeed3Decrease: () -> Unit,
     isHojuPositioningEnabled: Boolean,
     onToggleHojuPositioning: () -> Unit,
     logList: List<String>,
+    hojuState: String,
     t0locked: Boolean
 ) {
     val imageBitmap = ImageBitmap.imageResource(id = R.drawable.blackarrow)
@@ -1228,6 +1426,70 @@ fun ControllerUI(
             .rotate(if (isFlipped) 180f else 0f)
             .background(ControllerColors.Background),
     ) {
+        HudPanel(modifier = Modifier.width(368.dp).height(174.dp).offset(x=122.dp,).zIndex(1f), accent = ControllerColors.Success) {
+            HudSectionTitle("SPEED ADJUST", ControllerColors.Success)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    SpeedAdjustRow(
+                        label = "C1 BAKETU",
+                        value = baketuSpeed1,
+                        onIncrease = onBaketuSpeed1Increase,
+                        onDecrease = onBaketuSpeed1Decrease,
+                        accent = ControllerColors.Warning
+                    )
+
+                    SpeedAdjustRow(
+                        label = "C2 BAKETU",
+                        value = baketuSpeed2,
+                        onIncrease = onBaketuSpeed2Increase,
+                        onDecrease = onBaketuSpeed2Decrease,
+                        accent = ControllerColors.Warning
+                    )
+
+                    SpeedAdjustRow(
+                        label = "C3 BAKETU",
+                        value = baketuSpeed3,
+                        onIncrease = onBaketuSpeed3Increase,
+                        onDecrease = onBaketuSpeed3Decrease,
+                        accent = ControllerColors.Warning
+                    )
+                }
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    SpeedAdjustRow(
+                        label = "C1 HATA",
+                        value = hataSpeed1,
+                        onIncrease = onHataSpeed1Increase,
+                        onDecrease = onHataSpeed1Decrease,
+                        accent = ControllerColors.Accent
+                    )
+
+                    SpeedAdjustRow(
+                        label = "C2 HATA",
+                        value = hataSpeed2,
+                        onIncrease = onHataSpeed2Increase,
+                        onDecrease = onHataSpeed2Decrease,
+                        accent = ControllerColors.Accent
+                    )
+
+                    SpeedAdjustRow(
+                        label = "C3 HATA",
+                        value = hataSpeed3,
+                        onIncrease = onHataSpeed3Increase,
+                        onDecrease = onHataSpeed3Decrease,
+                        accent = ControllerColors.Accent
+                    )
+                }
+            }
+        }
         Box(
             modifier = Modifier
                 .size(370.dp)
@@ -1236,6 +1498,7 @@ fun ControllerUI(
                 .border(1.dp, ControllerColors.Border, RoundedCornerShape(6.dp))
                 .graphicsLayer { scaleX = if (mapID == "redmap") -1f else 1f }
         ) {
+
             Image(
                 painter = if (mapID == "redmap")painterResource(id = R.drawable.robocon_mapred) else painterResource(id = R.drawable.robocon_mapblue),
                 contentDescription = null,
@@ -1305,7 +1568,7 @@ fun ControllerUI(
         val hojuInRange = isInRange(targetHoju, posX, posY, posTheta)
         val canExecute = isHojuPositioningEnabled && hojuInRange
 
-        // 左側：ステータス表示（位置は維持）
+        // ?????????????????
         Column(
             modifier = Modifier
                 .align(Alignment.TopStart)
@@ -1327,7 +1590,7 @@ fun ControllerUI(
                 HudSectionTitle("ROBOT POSE")
                 Text("X   ${"%.2f".format(posX)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
                 Text("Y   ${"%.2f".format(posY)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
-                Text("θ   ${"%.2f".format(posTheta)}°", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+                Text("?   ${"%.2f".format(posTheta)}�", color = ControllerColors.TextPrimary, fontSize = 13.sp)
 
                 Text("SYSTEM LOG", color = ControllerColors.TextSecondary, fontWeight = FontWeight.Bold, fontSize = 10.sp, letterSpacing = 1.sp)
 
@@ -1374,7 +1637,7 @@ fun ControllerUI(
             }
         }
 
-        // 右上：turn値の表示と通常モードの列設定（位置は維持）
+        // ???turn?????????????????????
         Column(
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -1385,12 +1648,11 @@ fun ControllerUI(
         ) {
             HudPanel(modifier = Modifier.fillMaxWidth(), accent = ControllerColors.Warning) {
                 HudSectionTitle("TURN ADJUST  /  ${selectedTurnTarget.displayName()}", ControllerColors.Warning)
-                Text("HATA   X ${"%.2f".format(hataTurnX)}  Y ${"%.2f".format(hataTurnY)}  θ ${"%.2f".format(hataTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 10.sp)
-                Text("BAKETU X ${"%.2f".format(baketuTurnX)}  Y ${"%.2f".format(baketuTurnY)}  θ ${"%.2f".format(baketuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 10.sp)
-                Text("HOJU   X ${"%.2f".format(hojuTurnX)}  Y ${"%.2f".format(hojuTurnY)}  θ ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 10.sp)
-                Text("HATA SPEED   ${"%.1f".format(hataSpeed)}", color = ControllerColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 10.sp)
-                Text("BAKETU SPEED ${"%.1f".format(baketuSpeed)}", color = ControllerColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                Text("HATA   X ${"%.2f".format(hataTurnX)}  Y ${"%.2f".format(hataTurnY)}  ? ${"%.2f".format(hataTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 10.sp)
+                Text("HOJU   X ${"%.2f".format(hojuTurnX)}  Y ${"%.2f".format(hojuTurnY)}  ? ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 10.sp)
             }
+
+
 
             HudPanel(modifier = Modifier.fillMaxWidth(), accent = ControllerColors.Accent) {
                 HudSectionTitle("NORMAL MODE", ControllerColors.Accent, 16.sp)
@@ -1438,17 +1700,17 @@ fun ControllerUI(
             }
         }
 
-        // 補充位置決めボタン（配置は維持）
+        // ????????????????
         HudButton(
             text = when {
-                !hojuInRange -> "補充位置決め  /  OUT"
-                isHojuPositioningEnabled -> "補充位置決め  /  ON"
-                else -> "補充位置決め  /  OFF"
+                !hojuInRange -> "??????  /  OUT"
+                isHojuPositioningEnabled -> "??????  /  ON"
+                else -> "??????  /  OFF"
             },
             onClick = { if (hojuInRange) onToggleHojuPositioning() },
             modifier = Modifier
                 .width(130.dp)
-                .offset(505.dp, 170.dp),
+                .offset(505.dp, 120.dp),
             containerColor = if (isHojuPositioningEnabled) Color(0xFF124D37) else ControllerColors.Surface2,
             contentColor = if (!hojuInRange) ControllerColors.TextMuted else if (isHojuPositioningEnabled) ControllerColors.Success else ControllerColors.TextPrimary,
             enabled = hojuInRange,
@@ -1456,6 +1718,22 @@ fun ControllerUI(
             fontSize = 11.sp,
             accent = if (isHojuPositioningEnabled) ControllerColors.Success else ControllerColors.Border
         )
+
+        // ????????????hojustate????
+        HudPanel(
+            modifier = Modifier
+                .width(130.dp).height(70.dp)
+                .offset(505.dp, 182.dp),
+            accent = ControllerColors.Success
+        ) {
+            Text(
+                text = if (hojuState.isBlank()) "---" else hojuState,
+                color = ControllerColors.TextPrimary,
+                fontSize = 40.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
+            )
+        }
 
         // t0
         Button(
@@ -1476,6 +1754,24 @@ fun ControllerUI(
             Text(if (t0) "ON" else "OFF", fontWeight = FontWeight.Bold, color = ControllerColors.TextPrimary)
         }
 
+        // ????????????
+        Button(
+            onClick = onInterrupt,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(100.dp)
+                .size(80.dp)
+                .offset(470.dp, 70.dp)
+                .border(1.dp, ControllerColors.Danger, androidx.compose.foundation.shape.CircleShape),
+            shape = androidx.compose.foundation.shape.CircleShape,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (interrupt) Color(0xFF7A1F2A) else Color(0xFF521A22)
+            ),
+            elevation = ButtonDefaults.buttonElevation(0.dp)
+        ) {
+            Text("??", fontWeight = FontWeight.Bold, color = ControllerColors.TextPrimary)
+        }
+
         ModeSwitchButtons(
             currentScreen = ScreenState.CONTROLLER,
             onNavigate = onNavigateTo,
@@ -1488,39 +1784,7 @@ fun ControllerUI(
 
 fun TurnTarget.displayName(): String = when (this) {
     TurnTarget.HATA -> "HATA"
-    TurnTarget.BAKETU -> "BAKETU"
     TurnTarget.HOJU -> "HOJU"
-}
-
-@Composable
-fun TurnSelectButton(
-    label: String,
-    selected: Boolean,
-    enabled: Boolean = true,
-    onClick: () -> Unit
-) {
-    Button(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = Modifier
-            .width(90.dp)
-            .height(60.dp)
-            .border(
-                1.dp,
-                if (selected) ControllerColors.Accent else ControllerColors.Border,
-                RoundedCornerShape(7.dp)
-            ),
-        shape = RoundedCornerShape(7.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = if (selected) Color(0xFF124654) else ControllerColors.Surface2,
-            contentColor = if (selected) ControllerColors.TextPrimary else ControllerColors.TextSecondary,
-            disabledContainerColor = ControllerColors.Neutral.copy(alpha = 0.5f),
-            disabledContentColor = ControllerColors.TextMuted
-        ),
-        elevation = ButtonDefaults.buttonElevation(0.dp)
-    ) {
-        Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-    }
 }
 
 @Composable
@@ -1579,14 +1843,38 @@ fun RecoveryUI(
     onReload1: () -> Unit,
     onReload2: () -> Unit,
     onReload3: () -> Unit,
+    release: Boolean,
+    onRelease: () -> Unit,
     firehata: Boolean,
     onfirebaketu: () -> Unit,
     firebaketu: Boolean,
     pulfirebaketu: () -> Unit,
     pulrefill: () -> Unit,
     pulfirehata: () -> Unit,
+    hataLaser: Boolean,
+    onHataLaser: () -> Unit,
+    hojuLaser: Boolean,
+    onHojuLaser: () -> Unit,
     actionsLocked: Boolean,
-    logList: List<String>
+    logList: List<String>,
+    hataSpeed1: Float,
+    baketuSpeed1: Float,
+    hataSpeed2: Float,
+    baketuSpeed2: Float,
+    hataSpeed3: Float,
+    baketuSpeed3: Float,
+    onHataSpeed1Increase: () -> Unit,
+    onHataSpeed1Decrease: () -> Unit,
+    onBaketuSpeed1Increase: () -> Unit,
+    onBaketuSpeed1Decrease: () -> Unit,
+    onHataSpeed2Increase: () -> Unit,
+    onHataSpeed2Decrease: () -> Unit,
+    onBaketuSpeed2Increase: () -> Unit,
+    onBaketuSpeed2Decrease: () -> Unit,
+    onHataSpeed3Increase: () -> Unit,
+    onHataSpeed3Decrease: () -> Unit,
+    onBaketuSpeed3Increase: () -> Unit,
+    onBaketuSpeed3Decrease: () -> Unit,
 ) {
     val imageBitmap = ImageBitmap.imageResource(id = R.drawable.blackarrow)
     LaunchedEffect(circle, cross) {
@@ -1599,6 +1887,70 @@ fun RecoveryUI(
             .rotate(if (isFlipped) 180f else 0f)
             .background(ControllerColors.Background),
     ) {
+        HudPanel(modifier = Modifier.width(368.dp).height(174.dp).offset(x=122.dp,).zIndex(1f), accent = ControllerColors.Success) {
+            HudSectionTitle("SPEED ADJUST", ControllerColors.Success)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    SpeedAdjustRow(
+                        label = "C1 BAKETU",
+                        value = baketuSpeed1,
+                        onIncrease = onBaketuSpeed1Increase,
+                        onDecrease = onBaketuSpeed1Decrease,
+                        accent = ControllerColors.Warning
+                    )
+
+                    SpeedAdjustRow(
+                        label = "C2 BAKETU",
+                        value = baketuSpeed2,
+                        onIncrease = onBaketuSpeed2Increase,
+                        onDecrease = onBaketuSpeed2Decrease,
+                        accent = ControllerColors.Warning
+                    )
+
+                    SpeedAdjustRow(
+                        label = "C3 BAKETU",
+                        value = baketuSpeed3,
+                        onIncrease = onBaketuSpeed3Increase,
+                        onDecrease = onBaketuSpeed3Decrease,
+                        accent = ControllerColors.Warning
+                    )
+                }
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    SpeedAdjustRow(
+                        label = "C1 HATA",
+                        value = hataSpeed1,
+                        onIncrease = onHataSpeed1Increase,
+                        onDecrease = onHataSpeed1Decrease,
+                        accent = ControllerColors.Accent
+                    )
+
+                    SpeedAdjustRow(
+                        label = "C2 HATA",
+                        value = hataSpeed2,
+                        onIncrease = onHataSpeed2Increase,
+                        onDecrease = onHataSpeed2Decrease,
+                        accent = ControllerColors.Accent
+                    )
+
+                    SpeedAdjustRow(
+                        label = "C3 HATA",
+                        value = hataSpeed3,
+                        onIncrease = onHataSpeed3Increase,
+                        onDecrease = onHataSpeed3Decrease,
+                        accent = ControllerColors.Accent
+                    )
+                }
+            }
+        }
         Box(
             modifier = Modifier
                 .size(370.dp)
@@ -1681,7 +2033,7 @@ fun RecoveryUI(
                 HudSectionTitle("ROBOT POSE")
                 Text("X   ${"%.2f".format(posX)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
                 Text("Y   ${"%.2f".format(posY)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
-                Text("θ   ${"%.2f".format(posTheta)}°", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+                Text("?   ${"%.2f".format(posTheta)}�", color = ControllerColors.TextPrimary, fontSize = 13.sp)
                 HudSectionTitle("SYSTEM LOG", ControllerColors.TextSecondary, 10.sp)
 
                 val logScrollState = rememberLazyListState()
@@ -1730,11 +2082,11 @@ fun RecoveryUI(
             accent = ControllerColors.Warning
         ) {
             HudSectionTitle("RECOVERY MODE", ControllerColors.Warning, 20.sp)
-            Text("補充・発射操作", color = ControllerColors.TextSecondary, fontSize = 11.sp)
+            Text("???????", color = ControllerColors.TextSecondary, fontSize = 11.sp)
         }
 
         Column(
-            modifier = Modifier.offset(540.dp, 170.dp),
+            modifier = Modifier.offset(540.dp, 150.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             HudButton(
@@ -1770,18 +2122,29 @@ fun RecoveryUI(
                 fontSize = 11.sp,
                 accent = if (reload3) ControllerColors.Success else ControllerColors.Border
             )
+            HudButton(
+                text = if (release) "RELEASE  /  ACTIVE" else "RELEASE",
+                onClick = onRelease,
+                modifier = Modifier.width(100.dp),
+                containerColor = if (release) Color(0xFF124D37) else ControllerColors.Surface2,
+                contentColor = if (release) ControllerColors.Success else ControllerColors.TextPrimary,
+                enabled = !actionsLocked,
+                height = 50.dp,
+                fontSize = 11.sp,
+                accent = if (release) ControllerColors.Success else ControllerColors.Border
+            )
         }
 
         Column(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(30.dp)
-                .offset(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(1.dp)
+                .offset(-9.dp,y=-2.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
             horizontalAlignment = Alignment.End
         ) {
             HudButton(
-                text = if (refill) "補充  /  ACTIVE" else "補充",
+                text = if (refill) "??  /  ACTIVE" else "??",
                 onClick = onRefill,
                 modifier = Modifier.width(180.dp),
                 containerColor = if (refill) Color(0xFF124D37) else ControllerColors.Surface2,
@@ -1792,7 +2155,7 @@ fun RecoveryUI(
                 accent = if (refill) ControllerColors.Success else ControllerColors.Accent
             )
             HudButton(
-                text = if (firebaketu) "バケツ発射  /  ACTIVE" else "バケツ発射",
+                text = if (firebaketu) "?????  /  ACTIVE" else "?????",
                 onClick = onfirebaketu,
                 modifier = Modifier.width(180.dp),
                 containerColor = if (firebaketu) Color(0xFF124D37) else Color(0xFF4A2A0D),
@@ -1803,7 +2166,7 @@ fun RecoveryUI(
                 accent = ControllerColors.Warning
             )
             HudButton(
-                text = if (firehata) "旗発射  /  ACTIVE" else "旗発射",
+                text = if (firehata) "???  /  ACTIVE" else "???",
                 onClick = onfirehata,
                 modifier = Modifier.width(180.dp),
                 containerColor = if (firehata) Color(0xFF124D37) else Color(0xFF4E171E),
@@ -1823,6 +2186,29 @@ fun RecoveryUI(
                 fontSize = 17.sp,
                 accent = if (lowGain) ControllerColors.Success else ControllerColors.Border
             )
+            Row(){
+                HudButton(
+                    text = if (hataLaser) "HATA LASER  /  ACTIVE" else "HATA LASER",
+                    onClick = onHataLaser,
+                    modifier = Modifier.width(90.dp),
+                    containerColor = if (hataLaser) Color(0xFF124D37) else ControllerColors.Surface2,
+                    contentColor = if (hataLaser) ControllerColors.Success else ControllerColors.TextPrimary,
+                    height = 55.dp,
+                    fontSize = 9.sp,
+                    accent = if (hataLaser) ControllerColors.Success else ControllerColors.Warning
+                )
+                HudButton(
+                    text = if (hojuLaser) "HOJU LASER  /  ACTIVE" else "HOJU LASER",
+                    onClick = onHojuLaser,
+                    modifier = Modifier.width(90.dp),
+                    containerColor = if (hojuLaser) Color(0xFF124D37) else ControllerColors.Surface2,
+                    contentColor = if (hojuLaser) ControllerColors.Success else ControllerColors.TextPrimary,
+                    height = 55.dp,
+                    fontSize = 9.sp,
+                    accent = if (hojuLaser) ControllerColors.Success else ControllerColors.Warning
+                )
+            }
+
         }
 
         ModeSwitchButtons(
@@ -1835,163 +2221,6 @@ fun RecoveryUI(
     }
 }
 
-/**
- * 調整モードUI画面
- */
-@Composable
-fun AdjustmentUI(
-    isFlipped: Boolean,
-    selectedTurnTarget: TurnTarget,
-    onSelectTurnTarget: (TurnTarget) -> Unit,
-    hataTurnX: Float, hataTurnY: Float, hataTurnTheta: Float,
-    baketuTurnX: Float, baketuTurnY: Float, baketuTurnTheta: Float,
-    hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
-    hojuPositioningEnabled: Boolean,
-    hataSpeed: Float,
-    baketuSpeed: Float,
-    onHataSpeedIncrease: () -> Unit,
-    onHataSpeedDecrease: () -> Unit,
-    onBaketuSpeedIncrease: () -> Unit,
-    onBaketuSpeedDecrease: () -> Unit,
-    onNavigateTo: (ScreenState) -> Unit,
-) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .rotate(if (isFlipped) 180f else 0f)
-            .background(ControllerColors.Background)
-            .padding(24.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .offset(150.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            Text(
-                "ADJUSTMENT MODE",
-                fontWeight = FontWeight.Bold,
-                color = ControllerColors.Accent,
-                fontSize = 24.sp,
-                letterSpacing = 2.sp
-            )
-
-            HudPanel(modifier = Modifier.width(430.dp), accent = ControllerColors.Accent) {
-                HudSectionTitle("SPEED ADJUSTMENT", ControllerColors.Accent)
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        "HATA  ${"%.1f".format(hataSpeed)}",
-                        color = ControllerColors.TextPrimary,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.width(120.dp)
-                    )
-                    HudButton(
-                        text = "H −",
-                        onClick = onHataSpeedDecrease,
-                        modifier = Modifier.width(90.dp),
-                        height = 40.dp,
-                        fontSize = 12.sp,
-                        accent = ControllerColors.Border
-                    )
-                    HudButton(
-                        text = "H ＋",
-                        onClick = onHataSpeedIncrease,
-                        modifier = Modifier.width(90.dp),
-                        height = 40.dp,
-                        fontSize = 12.sp,
-                        accent = ControllerColors.Accent
-                    )
-                }
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        "BAKETU  ${"%.1f".format(baketuSpeed)}",
-                        color = ControllerColors.TextPrimary,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.width(120.dp)
-                    )
-                    HudButton(
-                        text = "B −",
-                        onClick = onBaketuSpeedDecrease,
-                        modifier = Modifier.width(90.dp),
-                        height = 40.dp,
-                        fontSize = 12.sp,
-                        accent = ControllerColors.Border
-                    )
-                    HudButton(
-                        text = "B ＋",
-                        onClick = onBaketuSpeedIncrease,
-                        modifier = Modifier.width(90.dp),
-                        height = 40.dp,
-                        fontSize = 12.sp,
-                        accent = ControllerColors.Warning
-                    )
-                }
-            }
-
-            HudPanel(modifier = Modifier.width(430.dp), accent = ControllerColors.Warning) {
-                HudSectionTitle("TURN TARGET ADJUSTMENT", ControllerColors.Warning)
-
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TurnSelectButton(
-                        label = "HATA",
-                        selected = selectedTurnTarget == TurnTarget.HATA,
-                        enabled = !hojuPositioningEnabled,
-                        onClick = { onSelectTurnTarget(TurnTarget.HATA) }
-                    )
-                    TurnSelectButton(
-                        label = "BAKETU",
-                        selected = selectedTurnTarget == TurnTarget.BAKETU,
-                        enabled = !hojuPositioningEnabled,
-                        onClick = { onSelectTurnTarget(TurnTarget.BAKETU) }
-                    )
-                    TurnSelectButton(
-                        label = "HOJU",
-                        selected = selectedTurnTarget == TurnTarget.HOJU,
-                        onClick = { onSelectTurnTarget(TurnTarget.HOJU) }
-                    )
-                }
-
-                val currentTurnText = when (selectedTurnTarget) {
-                    TurnTarget.HATA -> "HATA   X ${"%.2f".format(hataTurnX)}   Y ${"%.2f".format(hataTurnY)}   θ ${"%.2f".format(hataTurnTheta)}"
-                    TurnTarget.BAKETU -> "BAKETU X ${"%.2f".format(baketuTurnX)}   Y ${"%.2f".format(baketuTurnY)}   θ ${"%.2f".format(baketuTurnTheta)}"
-                    TurnTarget.HOJU -> "HOJU   X ${"%.2f".format(hojuTurnX)}   Y ${"%.2f".format(hojuTurnY)}   θ ${"%.2f".format(hojuTurnTheta)}"
-                }
-
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(ControllerColors.Background, RoundedCornerShape(6.dp))
-                        .border(1.dp, ControllerColors.BorderAccent, RoundedCornerShape(6.dp))
-                        .padding(horizontal = 10.dp, vertical = 8.dp)
-                ) {
-                    Text(
-                        currentTurnText,
-                        color = ControllerColors.TextPrimary,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        }
-
-        ModeSwitchButtons(
-            currentScreen = ScreenState.ADJUSTMENT,
-            onNavigate = onNavigateTo,
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 16.dp, end = 200.dp)
-                .offset(24.dp, -24.dp)
-        )
-    }
-}
 
 @Composable
 fun ModeSwitchButtons(
@@ -2005,15 +2234,14 @@ fun ModeSwitchButtons(
         horizontalAlignment = Alignment.End
     ) {
         val screens = listOf(
-            ScreenState.CONTROLLER to "通常モード",
-            ScreenState.RECOVERY to "リカバリー",
-            ScreenState.ADJUSTMENT to "調整モード"
+            ScreenState.CONTROLLER to "?????",
+            ScreenState.RECOVERY to "?????"
         )
 
         screens.forEach { (screen, label) ->
             val selected = currentScreen == screen
             HudButton(
-                text = if (selected) "●  $label" else "○  $label",
+                text = if (selected) "?  $label" else "?  $label",
                 onClick = { if (!selected) onNavigate(screen) },
                 modifier = Modifier.width(130.dp),
                 containerColor = if (selected) Color(0xFF123D46) else ControllerColors.Surface2,
