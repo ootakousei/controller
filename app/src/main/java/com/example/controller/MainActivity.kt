@@ -110,8 +110,8 @@ class MainActivity : ComponentActivity() {
     private var r1 by mutableStateOf(false)
     private var r2 by mutableStateOf(false)
 
-    private var posX by mutableStateOf(3900.0)
-    private var posY by mutableStateOf(0.0)
+    private var posX by mutableStateOf(3300.0)
+    private var posY by mutableStateOf(8645.0)
     private var posTheta by mutableStateOf(0.0)
     private var logList by mutableStateOf<List<String>>(emptyList())
     // robot??????hojustate:xxxxxxx??????????????????
@@ -148,6 +148,9 @@ class MainActivity : ComponentActivity() {
 
     private var hataLaser by mutableStateOf(false)
     private var hojuLaser by mutableStateOf(false)
+
+    // デバッグログを間引くための前回出力時刻。
+    private var lastLockDebugMs = 0L
 
     private var sendTime = 0L
     private val rttList = mutableStateListOf<Long>()
@@ -531,6 +534,18 @@ class MainActivity : ComponentActivity() {
         // --- ???? ---
         // ???????????????????????????????????
         // ????????????????????
+        // 移動先ボタンのロック判定は自己位置の受信にぶら下げず、一定間隔で回し続ける。
+        // ネットワーク初期化の成否や受信の途切れに左右されないよう、networkJob とは別に持つ。
+        lifecycleScope.launch {
+            while (isActive) {
+                if (currentScreen == ScreenState.CONTROLLER) {
+                    updateMoveTargetLock()
+                    logMoveTargetLockDebug()
+                }
+                delay(TARGET_LOCK_INTERVAL_MS)
+            }
+        }
+
         networkJob = lifecycleScope.launch(Dispatchers.IO) {
             if (!initializeNetworkWithRetry()) {
                 appendLog("NETWORK INIT FAILED: restarting app")
@@ -819,6 +834,9 @@ class MainActivity : ComponentActivity() {
      * （ON のまま固定はしないので、そのあと手動で OFF にできる）。
      */
     private fun selectMoveTarget(value: String) {
+        // 付近に居ないと押せない移動先は、ここで弾く（画面のタップも SELECT の順送りも通る道）。
+        val target = MOVE_TARGETS.firstOrNull { it.id == value }
+        if (target != null && !isMoveTargetUnlocked(target, posX, posY, posTheta)) return
         val changed = selectedTarget != value
         selectedTarget = value
         // 選ばれていない方のレーザーは位置決めが解けたとみなして落とす。
@@ -845,6 +863,53 @@ class MainActivity : ComponentActivity() {
         hojuLaser = false
     }
 
+    /** 何も選んでいない状態かどうか。起動直後の "" も含む。 */
+    private fun isMoveTargetCleared(): Boolean =
+        selectedTarget.isEmpty() || selectedTarget == "none"
+
+    /**
+     * 選択中の移動先が押せる範囲から外れていたら none に戻す。
+     * 付近でしか押せないボタンなのに、離れたあとも選択が残るのを防ぐ。
+     * 自己位置の受信が止まっていても一定間隔で呼ばれる。
+     */
+    private fun updateMoveTargetLock() {
+        if (isMoveTargetCleared()) return
+        val target = MOVE_TARGETS.firstOrNull { it.id == selectedTarget } ?: return
+        if (isMoveTargetUnlocked(target, posX, posY, posTheta)) return
+        clearMoveTarget()
+        appendLog("TARGET RELEASED: ${target.label}")
+    }
+
+    /**
+     * どのボタンも押せない状態のときに、一番近い基準位置との差を出す。
+     * * が付いた軸が許容幅を超えている。
+     */
+    private fun logMoveTargetLockDebug() {
+        if (!TARGET_LOCK_DEBUG) return
+        if (MOVE_TARGETS.any { isMoveTargetUnlocked(it, posX, posY, posTheta) }) return
+        val now = System.currentTimeMillis()
+        if (now - lastLockDebugMs < 1000) return
+        lastLockDebugMs = now
+
+        val nearest = MOVE_TARGETS
+            .filter { it.unlockArea?.enabled == true }
+            .minByOrNull { target ->
+                val area = target.unlockArea!!
+                Math.abs(posX - area.x) + Math.abs(posY - area.y)
+            } ?: return
+        val area = nearest.unlockArea!!
+        val dx = Math.abs(posX - area.x)
+        val dy = Math.abs(posY - area.y)
+        val dth = Math.abs(Math.IEEEremainder(Math.toDegrees(posTheta) - area.theta, 360.0))
+        val mark = { over: Boolean -> if (over) "*" else "" }
+        appendLog(
+            "LOCKED nearest=${nearest.label}" +
+                " dx${"%.0f".format(dx)}${mark(dx > UNLOCK_TOLERANCE_X)}" +
+                " dy${"%.0f".format(dy)}${mark(dy > UNLOCK_TOLERANCE_Y)}" +
+                " dth${"%.0f".format(dth)}${mark(dth > UNLOCK_TOLERANCE_THETA)}"
+        )
+    }
+
     /** turn 調整の対象を直接切り替える。HATA の連続調整 Job の面倒もここで見る。 */
     private fun setTurnTarget(target: TurnTarget) {
         if (selectedTurnTarget == target) return
@@ -865,7 +930,15 @@ class MainActivity : ComponentActivity() {
     private fun cycleBsTarget() {
         val index = BS_TARGET_CYCLE.indexOf(selectedTarget)
         if (index < 0) return
-        selectMoveTarget(BS_TARGET_CYCLE[(index + 1) % BS_TARGET_CYCLE.size])
+        // 押せない BS は飛ばして、次に押せるものまで送る。1周して戻ったら何もしない。
+        for (step in 1 until BS_TARGET_CYCLE.size) {
+            val next = BS_TARGET_CYCLE[(index + step) % BS_TARGET_CYCLE.size]
+            val target = MOVE_TARGETS.firstOrNull { it.id == next } ?: continue
+            if (isMoveTargetUnlocked(target, posX, posY, posTheta)) {
+                selectMoveTarget(next)
+                return
+            }
+        }
     }
 
     /**
@@ -1313,27 +1386,86 @@ private val FIELD_OBJECTS = listOf(
  * ????????????????????????????????????
  * ??????????????????????????????
  */
-private data class MoveTarget(val id: String, val label: String)
+private data class MoveTarget(
+    val id: String,
+    val label: String,
+    // このボタンが押せるようになる範囲。null なら位置に関係なくいつでも押せる。
+    val unlockArea: UnlockArea? = null
+)
+
+/**
+ * MOVE TARGET のボタンが押せるようになる基準位置。
+ * 自己位置がここを中心とした許容幅の中に居る間だけ、そのボタンを押せる。
+ * 付近以外に居る間はボタンがロックされ、押しても選べない。
+ *
+ * x / y は mm、theta は度（画面の ROBOT POSE の θ 表示と同じ単位）。
+ * ロボットからは theta がラジアンで届くので、判定の直前で度に直して比べる。
+ * 座標は赤 / 青で共通。画面描画と同じく、ロボットからは自サイド基準の値が来る前提。
+ *
+ * enabled = false にすると、座標を残したままその移動先のロックだけを止められる
+ * （= いつでも押せる）。
+ */
+private data class UnlockArea(
+    val x: Float,
+    val y: Float,
+    val theta: Float,
+    val enabled: Boolean = true
+)
+
+// 全ターゲット共通の許容幅。基準位置との差がこの値以内ならボタンを押せる。
+private const val UNLOCK_TOLERANCE_X = 500f       // mm
+private const val UNLOCK_TOLERANCE_Y = 500f       // mm
+private const val UNLOCK_TOLERANCE_THETA = 34f    // 度
+
+// ロック判定の間隔。自己位置の受信が途切れていてもこの間隔で評価し続ける。
+private const val TARGET_LOCK_INTERVAL_MS = 50L
+
+// true の間、全ボタンがロックされているときに一番近い基準位置との差を SYSTEM LOG に出す。
+private const val TARGET_LOCK_DEBUG = true
+
+/**
+ * その移動先のボタンをいま押せるか。
+ * 範囲を持たない（null）移動先と enabled = false の移動先は、位置に関係なく常に押せる。
+ */
+private fun isMoveTargetUnlocked(
+    target: MoveTarget,
+    posX: Double,
+    posY: Double,
+    posTheta: Double
+): Boolean {
+    val area = target.unlockArea ?: return true
+    if (!area.enabled) return true
+    if (Math.abs(posX - area.x) > UNLOCK_TOLERANCE_X) return false
+    if (Math.abs(posY - area.y) > UNLOCK_TOLERANCE_Y) return false
+    // 基準値も許容幅も度なので、自己位置のラジアンを度に直してから比べる。
+    // ±180° をまたいでも正しく比べられるよう正規化する。
+    val dTheta = Math.IEEEremainder(Math.toDegrees(posTheta) - area.theta, 360.0)
+    return Math.abs(dTheta) <= UNLOCK_TOLERANCE_THETA
+}
 
 // 画面での並びをそのまま表す。内側の listOf 1つが 1 行分。
 // SELECT ボタンで送る順番。BS3 -> BS2 -> BS1 -> BS3 と一周する。
 private val BS_TARGET_CYCLE = listOf("bs3", "bs2", "bs1")
 
+// unlockArea の x / y（mm）・theta（度）がそのボタンを押せる場所。enabled = false でロックなし。
 private val MOVE_TARGET_ROWS = listOf(
     listOf(
-        MoveTarget("tb1", "TB1"),
-        MoveTarget("tb2", "TB2")
+        MoveTarget("tb1", "TB1", UnlockArea(3300f, 3000f, 0f, enabled = true)),
+        MoveTarget("tb2", "TB2", UnlockArea(3300f, 8645f, 0f, enabled = true))
     ),
     listOf(
-        MoveTarget("bs1", "BS1"),
-        MoveTarget("bs2", "BS2"),
-        MoveTarget("bs3", "BS3")
+        MoveTarget("bs1", "BS1", UnlockArea(5000f, 4060f, 0f, enabled = true)),
+        MoveTarget("bs2", "BS2", UnlockArea(5000f, 3980f, 0f, enabled = true)),
+        MoveTarget("bs3", "BS3", UnlockArea(5000f, 3900f, 0f, enabled = true))
     ),
     listOf(
-        MoveTarget("hata", "HATA"),
-        MoveTarget("hoju", "HOJU")
+        MoveTarget("hata", "HATA", UnlockArea(4260f, 6100f, 0f, enabled = true)),
+        MoveTarget("hoju", "HOJU", UnlockArea(4080f, 500f, 0f, enabled = true))
     )
 )
+
+// ローをターゲット id で引けるようにしたもの。毎回 flatten() しないため。
+private val MOVE_TARGETS = MOVE_TARGET_ROWS.flatten()
 
 @Composable
 fun ControllerUI(
@@ -1401,6 +1533,8 @@ fun ControllerUI(
                             MoveTargetButton(
                                 label = target.label,
                                 selected = selectedTarget == target.id,
+                                // 付近に居ない間はロックして押せなくする。
+                                enabled = isMoveTargetUnlocked(target, posX, posY, posTheta),
                                 onClick = { onSelectTarget(target.id) }
                             )
                         }
@@ -1493,7 +1627,8 @@ fun ControllerUI(
                 HudSectionTitle("ROBOT POSE")
                 Text("X   ${"%.2f".format(posX)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
                 Text("Y   ${"%.2f".format(posY)} mm", color = ControllerColors.TextPrimary, fontSize = 13.sp)
-                Text("θ   ${"%.2f".format(posTheta)}°", color = ControllerColors.TextPrimary, fontSize = 13.sp)
+                // posTheta はラジアンで届くので、表示は度に直してから出す。
+                Text("θ   ${"%.2f".format(Math.toDegrees(posTheta))}°", color = ControllerColors.TextPrimary, fontSize = 13.sp)
 
                 Text("SYSTEM LOG", color = ControllerColors.TextSecondary, fontWeight = FontWeight.Bold, fontSize = 10.sp, letterSpacing = 1.sp)
 
@@ -1737,16 +1872,23 @@ private fun ObjectSelectButton(
 private fun MoveTargetButton(
     label: String,
     selected: Boolean,
+    enabled: Boolean,
     onClick: () -> Unit
 ) {
     HudButton(
         text = label,
         onClick = onClick,
         modifier = Modifier.width(100.dp),
+        enabled = enabled,
         containerColor = if (selected) Color(0xFF124D37) else ControllerColors.Surface2,
         contentColor = if (selected) ControllerColors.Success else ControllerColors.TextSecondary,
         height = 42.dp,
         fontSize = 12.sp,
-        accent = if (selected) ControllerColors.Success else ControllerColors.Border
+        // ロック中は枠も落として、押せないことが一目で分かるようにする。
+        accent = when {
+            !enabled -> ControllerColors.Neutral
+            selected -> ControllerColors.Success
+            else -> ControllerColors.Border
+        }
     )
 }
