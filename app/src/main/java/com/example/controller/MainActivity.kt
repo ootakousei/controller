@@ -5,6 +5,8 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.InputDevice
@@ -12,6 +14,12 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -32,10 +40,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
@@ -57,6 +67,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.ui.zIndex
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 
 // ??????????Enum
 enum class ScreenState {
@@ -79,6 +91,17 @@ private const val HATA_SPEED_MAX = 11.2f
 private const val DEKAZOUKIN_SPEED_DEFAULT = 9.0f
 private const val DEKAZOUKIN_SPEED_MIN = 8.0f
 private const val DEKAZOUKIN_SPEED_MAX = 10.0f
+
+// SPEED ADJUST の +/- を押しっぱなしにしたときの連続調整の間隔。HATA の turn 調整と同じ値。
+private const val SPEED_REPEAT_INITIAL_DELAY_MS = 160L
+private const val SPEED_REPEAT_INTERVAL_MS = 100L
+
+/** OBJECT ごとの射出速度の可変範囲。 */
+private fun speedRangeFor(objectId: String): ClosedFloatingPointRange<Float> = when (objectId) {
+    "hata" -> HATA_SPEED_MIN..HATA_SPEED_MAX
+    "dekazoukin" -> DEKAZOUKIN_SPEED_MIN..DEKAZOUKIN_SPEED_MAX
+    else -> BAKETU_SPEED_MIN..BAKETU_SPEED_MAX
+}
 
 class MainActivity : ComponentActivity() {
 
@@ -110,8 +133,8 @@ class MainActivity : ComponentActivity() {
     private var r1 by mutableStateOf(false)
     private var r2 by mutableStateOf(false)
 
-    private var posX by mutableStateOf(3300.0)
-    private var posY by mutableStateOf(8645.0)
+    private var posX by mutableStateOf(3800.0)
+    private var posY by mutableStateOf(445.0)
     private var posTheta by mutableStateOf(0.0)
     private var logList by mutableStateOf<List<String>>(emptyList())
     // robot??????hojustate:xxxxxxx??????????????????
@@ -138,7 +161,7 @@ class MainActivity : ComponentActivity() {
 
     // マップ横の一覧から選んだ移動先。
     // 基本は常にどれか1つが選択状態で、send() で "target" として送り続ける。
-    // ボタンの再タップでは解除されず、Lスティック / Rスティックの押し込み（L3 / R3）でのみ "none" に戻る。
+    // 選択中のボタンをもう一度押すか、Lスティック / Rスティックの押し込み（L3 / R3）で "none" に戻る。
     private var selectedTarget by mutableStateOf("")
 
     // START / SELECT / PS ?????????????????????
@@ -149,11 +172,22 @@ class MainActivity : ComponentActivity() {
     private var hataLaser by mutableStateOf(false)
     private var hojuLaser by mutableStateOf(false)
 
-    // デバッグログを間引くための前回出力時刻。
-    private var lastLockDebugMs = 0L
+    // いま自己位置的に押せる移動先の id。受信が止まっていても一定間隔で作り直す。
+    private var unlockedTargets by mutableStateOf<Set<String>>(emptySet())
+
 
     private var sendTime = 0L
     private val rttList = mutableStateListOf<Long>()
+
+    // PING_HOST への ping の最新結果。画面の NETWORK RTT の下に出す。
+    // pingOk = false の間（未実行 / タイムアウト / エラー）は赤で表示する。
+    private var pingText by mutableStateOf("---")
+    private var pingOk by mutableStateOf(false)
+
+    // 起動時に Wi-Fi / モバイル回線がつながっていたら true。途中では判定し直さない。
+    // つながっていると Android がそちらをデフォルトにし、ロボット宛ての UDP がそちらへ流れて届かなくなるので、
+    // 画面の背景を点滅させて警告を出す。
+    private var otherNetworkUp by mutableStateOf(false)
 
     // ????????????? String ("bluemap" ??? "redmap")???????????
     private var currentScreen by mutableStateOf(ScreenState.TEAM_SELECTION)
@@ -191,7 +225,7 @@ class MainActivity : ComponentActivity() {
     private var dekazoukinSpeed3 by mutableStateOf(DEKAZOUKIN_SPEED_DEFAULT)
 
     // ?????1????????
-    private val speedStep = 0.025f
+    private val speedStep = 0.01f
 
     private val t0CooldownSeconds = 2.0f   // ?????(?)???????????????
     private var t0Locked by mutableStateOf(false)  // true ??????????
@@ -208,6 +242,18 @@ class MainActivity : ComponentActivity() {
     }
     // ?????logList?????????
     // appendLog ?????????
+    /** インターネット用の Wi-Fi / モバイル回線が1本でもつながっているか。 */
+    @Suppress("DEPRECATION") // allNetworks は API 31 で非推奨だが、一度きりの判定には十分
+    private fun isOtherNetworkConnected(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        return cm.allNetworks.any { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@any false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR))
+        }
+    }
+
     private fun appendLog(msg: String) {
         runOnUiThread {
             val last = logList.lastOrNull()
@@ -400,7 +446,7 @@ class MainActivity : ComponentActivity() {
                     return true
                 }
                 KeyEvent.KEYCODE_BUTTON_START -> { start = true; return true }
-                // SELECT ボタンで BS3 -> BS2 -> BS1 -> BS3 と切り替える
+                // SELECT ボタンで BS1 -> BS2 -> BS3 -> BS1 と切り替える
                 KeyEvent.KEYCODE_BUTTON_SELECT -> {
                     select = true
                     if (event.repeatCount == 0) {
@@ -467,6 +513,44 @@ class MainActivity : ComponentActivity() {
     // （初期値のまま保存して既存の調整値を潰すのを防ぐ）。
     private var loadedSettingsMapID: String? = null
 
+    // turn 調整値と射出速度は con.py 側が正本を持つ。起動直後は false で、con.py から
+    // 設定値（ログ用ポート 5006 の "settings"）を受け取って反映したら true になる。
+    // false の間は send() で "synced":false を送り、con.py は自分の保存値を使いつつ送り返してくる。
+    // 受け取る前に調整しても上書きされるだけなので、false の間は調整を受け付けない。
+    private var settingsSynced by mutableStateOf(false)
+
+    /** con.py から届いた設定値を反映する。UI スレッドで呼ぶ。 */
+    private fun applyRemoteSettings(settings: JSONObject) {
+        val mapId = settings.optString("map_id", "")
+        // チーム選択前や別サイドの値は使わない。同期済みなら手元の値が最新なので無視する。
+        if (mapId != loadedSettingsMapID || settingsSynced) return
+        fun f(name: String, current: Float): Float =
+            settings.optDouble(name, current.toDouble()).toFloat()
+        hata_turnx = f("hata_turnx", hata_turnx)
+        hata_turny = f("hata_turny", hata_turny)
+        hata_turntheta = f("hata_turntheta", hata_turntheta)
+        hoju_turnx = f("hoju_turnx", hoju_turnx)
+        hoju_turny = f("hoju_turny", hoju_turny)
+        hoju_turntheta = f("hoju_turntheta", hoju_turntheta)
+        baketu_turnx = f("baketu_turnx", baketu_turnx)
+        baketu_turny = f("baketu_turny", baketu_turny)
+        baketu_turntheta = f("baketu_turntheta", baketu_turntheta)
+        hataSpeed1 = f("hata_speed1", hataSpeed1)
+        hataSpeed2 = f("hata_speed2", hataSpeed2)
+        hataSpeed3 = f("hata_speed3", hataSpeed3)
+        baketuSpeed1 = f("baketu_speed1", baketuSpeed1)
+        baketuSpeed2 = f("baketu_speed2", baketuSpeed2)
+        baketuSpeed3 = f("baketu_speed3", baketuSpeed3)
+        dekazoukinSpeed1 = f("dekazoukin_speed1", dekazoukinSpeed1)
+        dekazoukinSpeed2 = f("dekazoukin_speed2", dekazoukinSpeed2)
+        dekazoukinSpeed3 = f("dekazoukin_speed3", dekazoukinSpeed3)
+        // 値を入れ終わってから同期済みにする（sendLoop が古い値を synced=true で送らないように）。
+        settingsSynced = true
+        // 手元の SharedPreferences はキャッシュとして更新しておく。
+        saveSettings()
+        appendLog("SETTINGS SYNCED: $mapId")
+    }
+
     /**
      * サイドごとのキーを読む。"<mapId>_<name>" が無ければ旧バージョンの
      * サイド共用キー "<name>" を使う（それも無ければ default）。
@@ -531,6 +615,10 @@ class MainActivity : ComponentActivity() {
         hideSystemUI()
         startLockTaskMode()
 
+        // Wi-Fi / モバイル回線の判定は起動時の1回だけ。
+        otherNetworkUp = isOtherNetworkConnected()
+        if (otherNetworkUp) appendLog("WIFI / MOBILE DATA ON: turn them off")
+
         // --- ???? ---
         // ???????????????????????????????????
         // ????????????????????
@@ -539,14 +627,21 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             while (isActive) {
                 if (currentScreen == ScreenState.CONTROLLER) {
-                    updateMoveTargetLock()
-                    logMoveTargetLockDebug()
+                    refreshUnlockedTargets()
                 }
                 delay(TARGET_LOCK_INTERVAL_MS)
             }
         }
 
-        networkJob = lifecycleScope.launch(Dispatchers.IO) {
+        // ルーターへの ping。UDP ソケットとは無関係に回したいので networkJob とは別に持つ。
+        lifecycleScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                pingOnce()
+                delay(PING_INTERVAL_MS)
+            }
+        }
+
+        networkJob =lifecycleScope.launch(Dispatchers.IO) {
             if (!initializeNetworkWithRetry()) {
                 appendLog("NETWORK INIT FAILED: restarting app")
                 withContext(Dispatchers.Main) {
@@ -565,6 +660,7 @@ class MainActivity : ComponentActivity() {
                 ScreenState.TEAM_SELECTION -> {
                     TeamSelectionScreen(
                         isFlipped = isFlipped,
+                        networkWarning = otherNetworkUp,
                         onToggleFlip = { isFlipped = !isFlipped },
                         onSelectTeam = { mapStr ->
                             selectedMapID = mapStr
@@ -577,8 +673,11 @@ class MainActivity : ComponentActivity() {
                 ScreenState.CONTROLLER -> {
                     ControllerUI(
                         isFlipped = isFlipped,
+                        networkWarning = otherNetworkUp,
                         mapID = selectedMapID,
                         rttList = rttList,
+                        pingText = pingText,
+                        pingOk = pingOk,
                         posX = posX,
                         posY = posY,
                         posTheta = posTheta,
@@ -601,6 +700,7 @@ class MainActivity : ComponentActivity() {
                         },
                         selectedTarget = selectedTarget,
                         onSelectTarget = { value -> selectMoveTarget(value) },
+                        unlockedTargets = unlockedTargets,
                         hataLaser = hataLaser,
                         onHataLaser = { hataLaser = !hataLaser },
                         hojuLaser = hojuLaser,
@@ -615,7 +715,8 @@ class MainActivity : ComponentActivity() {
                         onSpeedDecrease = { column -> adjustSelectedObjectSpeed(column, -speedStep) },
                         logList = logList,
                         hojuState = hojuState,
-                        t0locked = t0Locked
+                        t0locked = t0Locked,
+                        settingsSynced = settingsSynced
                     )
                 }
             }
@@ -713,6 +814,37 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * 端末の ping コマンドで PING_HOST に1回だけ ping し、結果を pingText / pingOk に入れる。
+     * Java からは ICMP を直接送れないので、コマンドの出力の "time=12.3 ms" を読む。
+     * ブロッキングするので Dispatchers.IO から呼ぶ。
+     */
+    private fun pingOnce() {
+        var process: Process? = null
+        try {
+            process = ProcessBuilder("ping", "-c", "1", "-W", "1", PING_HOST)
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            process.waitFor()
+            val timeMs = Regex("""time[=<]([\d.]+)\s*ms""").find(output)
+                ?.groupValues?.get(1)?.toFloatOrNull()
+            if (timeMs != null) {
+                pingText = "%.1f ms".format(timeMs)
+                pingOk = true
+            } else {
+                pingText = "TIMEOUT"
+                pingOk = false
+            }
+        } catch (e: Exception) {
+            pingText = "ERROR"
+            pingOk = false
+            appendLog("PING ERROR: ${e.javaClass.simpleName} ${e.message}")
+        } finally {
+            process?.destroy()
+        }
+    }
+
+    /**
      * ??????10ms???????????UDP??????
      * lifecycleScope.launch(Dispatchers.IO) ??????????????????
      */
@@ -737,7 +869,8 @@ class MainActivity : ComponentActivity() {
                     left, right, up, down,
                     circle, triangle, square, cross,
                     l1, l2, r1, r2,
-                    start, select, ps
+                    start, select, ps,
+                    settingsSynced
                 )
             }
             delay(10)
@@ -780,7 +913,8 @@ class MainActivity : ComponentActivity() {
      * ?????????????????????????????????
      */
     private suspend fun CoroutineScope.logReceiveLoop() {
-        val buf = ByteArray(1024)
+        // 設定値の同期パケットも来るので余裕を持たせる
+        val buf = ByteArray(4096)
         while (isActive) {
             try {
                 val packet = DatagramPacket(buf, buf.size)
@@ -788,26 +922,40 @@ class MainActivity : ComponentActivity() {
 
                 val jsonString = String(packet.data, 0, packet.length)
                 val json = JSONObject(jsonString)
+
+                // con.py が保存している turn / speed。同期待ちの間だけ送られてくる。
+                json.optJSONObject("settings")?.let { settings ->
+                    runOnUiThread { applyRemoteSettings(settings) }
+                }
+
                 val receivedLog = json.optString("log", "")
 
                 if (receivedLog.isNotBlank() && !receivedLog.equals("none", ignoreCase = true)) {
                     val normalLines = mutableListOf<String>()
                     var latestHojuState: String? = null
+                    var invalidTarget = false
 
                     receivedLog.split("\n")
                         .map { it.trim() }
                         .filter { it.isNotBlank() && !it.equals("none", ignoreCase = true) }
                         .forEach { line ->
+                            // ロボットが移動先を受け付けなかった合図。ログにも残す。
+                            if (line.contains("invalid_target", ignoreCase = true)) {
+                                invalidTarget = true
+                            }
                             if (line.startsWith("hojustate:")) {
+                                // 画面には "hojustate:" を外した中身だけを出す。
                                 // hojustate???UI????SYSTEM LOG???????
-                                latestHojuState = line
+                                latestHojuState = line.removePrefix("hojustate:").trim()
                             } else {
                                 normalLines += line
                             }
                         }
 
-                    if (latestHojuState != null || normalLines.isNotEmpty()) {
+                    if (latestHojuState != null || normalLines.isNotEmpty() || invalidTarget) {
                         runOnUiThread {
+                            // invalid_target が来たら、何を選んでいても MOVE TARGET を解除する。
+                            if (invalidTarget) clearMoveTarget()
                             latestHojuState?.let { hojuState = it }
                             if (normalLines.isNotEmpty()) {
                                 logList = (logList + normalLines).takeLast(50)
@@ -829,30 +977,48 @@ class MainActivity : ComponentActivity() {
      */
     /**
      * MOVE TARGET の選択。hata / hoju なら turn 調整の対象もそれに合わせる。
-     * 選択中のボタンを再タップしても解除はしない（解除は L3 / R3 のみ）。
+     * 選択中のボタンをもう一度押すと解除する（L3 / R3 と同じ扱い）。
      * hata / hoju に切り替わったときは、対応するレーザーを1回だけ ON にする
      * （ON のまま固定はしないので、そのあと手動で OFF にできる）。
+     * OBJECT も移動先に合わせて切り替える（BS 系 -> バケツ / hata -> 旗 / dekahoju・dekahata -> デカ雑巾）。
+     * ただし OBJECT がデカ雑巾のとき（デカ補充のあと）は hata を選んでも旗にせずデカ雑巾のままにする。
+     * こちらも選んだ瞬間に1回だけなので、そのあと手動や PS ボタンで変えられる。
      */
     private fun selectMoveTarget(value: String) {
-        // 付近に居ないと押せない移動先は、ここで弾く（画面のタップも SELECT の順送りも通る道）。
-        val target = MOVE_TARGETS.firstOrNull { it.id == value }
-        if (target != null && !isMoveTargetUnlocked(target, posX, posY, posTheta)) return
-        val changed = selectedTarget != value
+        // 同じボタンをもう一度押したら解除する。選択中なのでロック判定は見るまでもない。
+        if (selectedTarget == value) {
+            clearMoveTarget()
+            return
+        }
+        // 押せない移動先はここで弾く（画面のタップも SELECT の順送りも通る道）。
+        if (!canPressMoveTarget(value, selectedTarget, unlockedTargets)) return
         selectedTarget = value
         // 選ばれていない方のレーザーは位置決めが解けたとみなして落とす。
-        if (value != "hata") hataLaser = false
+        if (value != "hata" && value != "dekahata") hataLaser = false
         if (value != "hoju") hojuLaser = false
         when (value) {
             "hata" -> {
                 setTurnTarget(TurnTarget.HATA)
                 // 選んだ瞬間に1回だけ点ける。以降は固定しないので手動で消せる。
-                if (changed) hataLaser = true
+                hataLaser = true
+                // デカ補充のあとに旗へ向かうときはデカ雑巾を撃つので、OBJECT はデカ雑巾のまま残す。
+                if (selectedObject != "dekazoukin") selectedObject = "hata"
+            }
+            // デカ雑巾を旗に撃ちに行く。turn / レーザーは hata と同じで、OBJECT は必ずデカ雑巾。
+            "dekahata" -> {
+                setTurnTarget(TurnTarget.HATA)
+                hataLaser = true
+                selectedObject = "dekazoukin"
             }
             "hoju" -> {
                 setTurnTarget(TurnTarget.HOJU)
-                if (changed) hojuLaser = true
+                hojuLaser = true
             }
-            "bs1", "bs2", "bs3" -> setTurnTarget(TurnTarget.BAKETU)
+            "dekahoju" -> selectedObject = "dekazoukin"
+            "bs1", "bs2", "bs3" -> {
+                setTurnTarget(TurnTarget.BAKETU)
+                selectedObject = "baketu"
+            }
         }
     }
 
@@ -863,51 +1029,12 @@ class MainActivity : ComponentActivity() {
         hojuLaser = false
     }
 
-    /** 何も選んでいない状態かどうか。起動直後の "" も含む。 */
-    private fun isMoveTargetCleared(): Boolean =
-        selectedTarget.isEmpty() || selectedTarget == "none"
-
-    /**
-     * 選択中の移動先が押せる範囲から外れていたら none に戻す。
-     * 付近でしか押せないボタンなのに、離れたあとも選択が残るのを防ぐ。
-     * 自己位置の受信が止まっていても一定間隔で呼ばれる。
-     */
-    private fun updateMoveTargetLock() {
-        if (isMoveTargetCleared()) return
-        val target = MOVE_TARGETS.firstOrNull { it.id == selectedTarget } ?: return
-        if (isMoveTargetUnlocked(target, posX, posY, posTheta)) return
-        clearMoveTarget()
-        appendLog("TARGET RELEASED: ${target.label}")
-    }
-
-    /**
-     * どのボタンも押せない状態のときに、一番近い基準位置との差を出す。
-     * * が付いた軸が許容幅を超えている。
-     */
-    private fun logMoveTargetLockDebug() {
-        if (!TARGET_LOCK_DEBUG) return
-        if (MOVE_TARGETS.any { isMoveTargetUnlocked(it, posX, posY, posTheta) }) return
-        val now = System.currentTimeMillis()
-        if (now - lastLockDebugMs < 1000) return
-        lastLockDebugMs = now
-
-        val nearest = MOVE_TARGETS
-            .filter { it.unlockArea?.enabled == true }
-            .minByOrNull { target ->
-                val area = target.unlockArea!!
-                Math.abs(posX - area.x) + Math.abs(posY - area.y)
-            } ?: return
-        val area = nearest.unlockArea!!
-        val dx = Math.abs(posX - area.x)
-        val dy = Math.abs(posY - area.y)
-        val dth = Math.abs(Math.IEEEremainder(Math.toDegrees(posTheta) - area.theta, 360.0))
-        val mark = { over: Boolean -> if (over) "*" else "" }
-        appendLog(
-            "LOCKED nearest=${nearest.label}" +
-                " dx${"%.0f".format(dx)}${mark(dx > UNLOCK_TOLERANCE_X)}" +
-                " dy${"%.0f".format(dy)}${mark(dy > UNLOCK_TOLERANCE_Y)}" +
-                " dth${"%.0f".format(dth)}${mark(dth > UNLOCK_TOLERANCE_THETA)}"
-        )
+    /** 自己位置から、いま押せる移動先を洗い直す。自己位置の受信が止まっていても一定間隔で呼ばれる。 */
+    private fun refreshUnlockedTargets() {
+        unlockedTargets = moveTargetsFor(selectedMapID)
+            .filter { isMoveTargetUnlocked(it, posX, posY, posTheta) }
+            .map { it.id }
+            .toSet()
     }
 
     /** turn 調整の対象を直接切り替える。HATA の連続調整 Job の面倒もここで見る。 */
@@ -924,21 +1051,14 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * SELECT ボタンで MOVE TARGET を BS3 -> BS2 -> BS1 -> BS3 と順送りする。
+     * SELECT ボタンで MOVE TARGET を BS1 -> BS2 -> BS3 -> BS1 と順送りする。
      * BS 以外を選んでいるとき（none 含む）は何もしない。
      */
     private fun cycleBsTarget() {
         val index = BS_TARGET_CYCLE.indexOf(selectedTarget)
         if (index < 0) return
-        // 押せない BS は飛ばして、次に押せるものまで送る。1周して戻ったら何もしない。
-        for (step in 1 until BS_TARGET_CYCLE.size) {
-            val next = BS_TARGET_CYCLE[(index + step) % BS_TARGET_CYCLE.size]
-            val target = MOVE_TARGETS.firstOrNull { it.id == next } ?: continue
-            if (isMoveTargetUnlocked(target, posX, posY, posTheta)) {
-                selectMoveTarget(next)
-                return
-            }
-        }
+        // BS を選んでいる時点で何か選択中なので、ロックは掛からず必ず送れる。
+        selectMoveTarget(BS_TARGET_CYCLE[(index + 1) % BS_TARGET_CYCLE.size])
     }
 
     /**
@@ -957,6 +1077,8 @@ class MainActivity : ComponentActivity() {
         dy: Float = 0f,
         dtheta: Float = 0f
     ) {
+        // con.py の保存値を受け取るまでは調整しない（受け取った時点で上書きされるため）。
+        if (!settingsSynced) return
         when (selectedTurnTarget) {
             TurnTarget.HATA -> {
                 hata_turnx += dx
@@ -1000,9 +1122,10 @@ class MainActivity : ComponentActivity() {
 
     /** 選択中の OBJECT の column（1..3）の速度を delta 分動かす。範囲は物体ごと。 */
     private fun adjustSelectedObjectSpeed(column: Int, delta: Float) {
+        if (!settingsSynced) return
+        fun clamp(v: Float) = v.coerceIn(speedRangeFor(selectedObject))
         when (selectedObject) {
             "hata" -> {
-                fun clamp(v: Float) = v.coerceIn(HATA_SPEED_MIN, HATA_SPEED_MAX)
                 when (column) {
                     1 -> hataSpeed1 = clamp(hataSpeed1 + delta)
                     2 -> hataSpeed2 = clamp(hataSpeed2 + delta)
@@ -1010,7 +1133,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
             "dekazoukin" -> {
-                fun clamp(v: Float) = v.coerceIn(DEKAZOUKIN_SPEED_MIN, DEKAZOUKIN_SPEED_MAX)
                 when (column) {
                     1 -> dekazoukinSpeed1 = clamp(dekazoukinSpeed1 + delta)
                     2 -> dekazoukinSpeed2 = clamp(dekazoukinSpeed2 + delta)
@@ -1018,7 +1140,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
             else -> {
-                fun clamp(v: Float) = v.coerceIn(BAKETU_SPEED_MIN, BAKETU_SPEED_MAX)
                 when (column) {
                     1 -> baketuSpeed1 = clamp(baketuSpeed1 + delta)
                     2 -> baketuSpeed2 = clamp(baketuSpeed2 + delta)
@@ -1066,10 +1187,11 @@ class MainActivity : ComponentActivity() {
         left: Boolean, right: Boolean, up: Boolean, down: Boolean,
         circle: Boolean, triangle: Boolean, square: Boolean, cross: Boolean,
         l1: Boolean, l2: Boolean, r1: Boolean, r2: Boolean,
-        start: Boolean, select: Boolean, ps: Boolean
+        start: Boolean, select: Boolean, ps: Boolean,
+        synced: Boolean
     ) {
         try {
-            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed1":$hataSpeed1,"baketu_speed1":$baketuSpeed1,"hata_speed2":$hataSpeed2,"baketu_speed2":$baketuSpeed2,"hata_speed3":$hataSpeed3,"baketu_speed3":$baketuSpeed3,"dekazoukin_speed1":$dekazoukinSpeed1,"dekazoukin_speed2":$dekazoukinSpeed2,"dekazoukin_speed3":$dekazoukinSpeed3,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"mode":"$mode","object":"$selectedObject","target":"$selectedTarget","hatalaser":$hataLaser,"hojulaser":$hojuLaser,"t0":$t0,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2,"start":$start,"select":$select,"ps":$ps}"""
+            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed1":$hataSpeed1,"baketu_speed1":$baketuSpeed1,"hata_speed2":$hataSpeed2,"baketu_speed2":$baketuSpeed2,"hata_speed3":$hataSpeed3,"baketu_speed3":$baketuSpeed3,"dekazoukin_speed1":$dekazoukinSpeed1,"dekazoukin_speed2":$dekazoukinSpeed2,"dekazoukin_speed3":$dekazoukinSpeed3,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"mode":"$mode","object":"$selectedObject","target":"$selectedTarget","hatalaser":$hataLaser,"hojulaser":$hojuLaser,"t0":$t0,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2,"start":$start,"select":$select,"ps":$ps,"synced":$synced}"""
             val buf = msg.toByteArray()
             val packet = DatagramPacket(buf, buf.size, address, port)
             sendTime = System.nanoTime()
@@ -1143,6 +1265,51 @@ private object ControllerColors {
     val Red = Color(0xFF8F2530)
     val Blue = Color(0xFF175F8A)
     val Neutral = Color(0xFF2A353B)
+}
+
+/**
+ * 画面の背景色。networkWarning の間は Background と Danger の間で点滅させる。
+ */
+@Composable
+private fun screenBackground(networkWarning: Boolean): Color {
+    if (!networkWarning) return ControllerColors.Background
+    val fraction by rememberInfiniteTransition(label = "networkWarning").animateFloat(
+        initialValue = 0f,
+        targetValue = 0.7f,
+        animationSpec = infiniteRepeatable(tween(400, easing = LinearEasing), RepeatMode.Reverse),
+        label = "networkWarningFraction"
+    )
+    return lerp(ControllerColors.Background, ControllerColors.Danger, fraction)
+}
+
+/**
+ * 起動時に Wi-Fi / モバイル回線がつながっていたときに画面上部へ出す警告。
+ * クリック処理を持たないので、下にあるボタンへのタップはそのまま通る。
+ */
+@Composable
+private fun NetworkWarningBanner(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .zIndex(10f)
+            .padding(top = 8.dp)
+            .background(ControllerColors.Danger, RoundedCornerShape(8.dp))
+            .border(2.dp, ControllerColors.TextPrimary, RoundedCornerShape(8.dp))
+            .padding(horizontal = 24.dp, vertical = 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "⚠ Wi-Fi / モバイルデータを OFF にしてください",
+            fontSize = 22.sp,
+            fontWeight = FontWeight.Bold,
+            color = ControllerColors.TextPrimary
+        )
+        Text(
+            text = "ON のままだとロボットと通信できません",
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            color = ControllerColors.TextPrimary
+        )
+    }
 }
 
 @Composable
@@ -1241,15 +1408,21 @@ private fun HudButton(
 
 /**
  * ??????1????? + ??? + ?/?????
+ * 上限 / 下限に達した側のボタンは無効（灰色）にする。
  */
 @Composable
 private fun SpeedAdjustRow(
     label: String,
     value: Float,
+    range: ClosedFloatingPointRange<Float>,
     onIncrease: () -> Unit,
     onDecrease: () -> Unit,
-    accent: Color = ControllerColors.Accent
+    accent: Color = ControllerColors.Accent,
+    enabled: Boolean = true
 ) {
+    // 0.01 刻みの足し引きで誤差が乗るので、端との比較は少し余裕を持たせる。
+    val canDecrease = enabled && value > range.start + 1e-4f
+    val canIncrease = enabled && value < range.endInclusive - 1e-4f
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -1262,22 +1435,80 @@ private fun SpeedAdjustRow(
             fontWeight = FontWeight.Bold,
             modifier = Modifier.weight(1f)
         )
-        HudButton(
-            text = "-",
-            onClick = onDecrease,
-            modifier = Modifier.width(38.dp),
-            height = 44.dp,
-            fontSize = 18.sp,
-            accent = ControllerColors.Border
-        )
-        HudButton(
-            text = "+",
-            onClick = onIncrease,
-            modifier = Modifier.width(38.dp),
-            height = 44.dp,
-            fontSize = 18.sp,
-            accent = accent
-        )
+        SpeedStepButton(text = "-", enabled = canDecrease, onStep = onDecrease, accent = accent)
+        SpeedStepButton(text = "+", enabled = canIncrease, onStep = onIncrease, accent = accent)
+    }
+}
+
+/**
+ * SPEED ADJUST の +/- ボタン。押した瞬間に1回動かし、押しっぱなしなら
+ * HATA の turn 調整と同じく SPEED_REPEAT_INITIAL_DELAY_MS 後から SPEED_REPEAT_INTERVAL_MS ごとに動かし続ける。
+ * 有効なときは OBJECT の色、無効（上限 / 下限）のときは灰色で表示する。
+ */
+@Composable
+private fun SpeedStepButton(
+    text: String,
+    enabled: Boolean,
+    onStep: () -> Unit,
+    accent: Color
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    // OBJECT を切り替えると onStep の中身も変わるので、常に最新を呼ぶ。
+    val currentOnStep by rememberUpdatedState(onStep)
+    LaunchedEffect(pressed, enabled) {
+        if (!pressed || !enabled) return@LaunchedEffect
+        currentOnStep()
+        delay(SPEED_REPEAT_INITIAL_DELAY_MS)
+        while (true) {
+            delay(SPEED_REPEAT_INTERVAL_MS)
+            currentOnStep()
+        }
+    }
+
+    val shape = RoundedCornerShape(7.dp)
+    val containerColor = when {
+        !enabled -> ControllerColors.Neutral.copy(alpha = 0.35f)
+        pressed -> accent.copy(alpha = 0.45f)
+        else -> accent.copy(alpha = 0.18f)
+    }
+    val contentColor = if (enabled) accent else ControllerColors.TextMuted
+    val borderColor = if (enabled) accent else ControllerColors.Border
+    Button(
+        // 調整は押下で行うので、離したときの onClick では何もしない。
+        onClick = {},
+        enabled = enabled,
+        interactionSource = interactionSource,
+        modifier = Modifier.width(38.dp).height(44.dp),
+        shape = shape,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = containerColor,
+            contentColor = contentColor,
+            disabledContainerColor = containerColor,
+            disabledContentColor = contentColor
+        ),
+        elevation = ButtonDefaults.buttonElevation(
+            defaultElevation = 0.dp,
+            pressedElevation = 0.dp,
+            focusedElevation = 0.dp,
+            hoveredElevation = 0.dp,
+            disabledElevation = 0.dp
+        ),
+        contentPadding = PaddingValues(0.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .border(1.dp, borderColor, shape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = text,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = contentColor
+            )
+        }
     }
 }
 
@@ -1287,6 +1518,8 @@ private fun SpeedAdjustRow(
 @Composable
 fun TeamSelectionScreen(
     isFlipped: Boolean,
+    // 起動時に Wi-Fi / モバイル回線がつながっていたら true。背景の点滅と警告を出す。
+    networkWarning: Boolean,
     onToggleFlip: () -> Unit,
     onSelectTeam: (mapStr: String) -> Unit
 ) {
@@ -1294,9 +1527,10 @@ fun TeamSelectionScreen(
         modifier = Modifier
             .fillMaxSize()
             .rotate(if (isFlipped) 180f else 0f)
-            .background(ControllerColors.Background),
+            .background(screenBackground(networkWarning)),
         contentAlignment = Alignment.Center
     ) {
+        if (networkWarning) NetworkWarningBanner(Modifier.align(Alignment.TopCenter))
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(32.dp)
@@ -1400,7 +1634,7 @@ private data class MoveTarget(
  *
  * x / y は mm、theta は度（画面の ROBOT POSE の θ 表示と同じ単位）。
  * ロボットからは theta がラジアンで届くので、判定の直前で度に直して比べる。
- * 座標は赤 / 青で共通。画面描画と同じく、ロボットからは自サイド基準の値が来る前提。
+ * 座標は赤 / 青で別々に定義する（RED_ / BLUE_MOVE_TARGET_ROWS）。ロボットからは自サイド基準の値が来る前提。
  *
  * enabled = false にすると、座標を残したままその移動先のロックだけを止められる
  * （= いつでも押せる）。
@@ -1420,12 +1654,29 @@ private const val UNLOCK_TOLERANCE_THETA = 34f    // 度
 // ロック判定の間隔。自己位置の受信が途切れていてもこの間隔で評価し続ける。
 private const val TARGET_LOCK_INTERVAL_MS = 50L
 
-// true の間、全ボタンがロックされているときに一番近い基準位置との差を SYSTEM LOG に出す。
-private const val TARGET_LOCK_DEBUG = true
+// ping の宛先と間隔。結果は NETWORK RTT の下に出す。
+private const val PING_HOST = "192.168.11.1"
+private const val PING_INTERVAL_MS = 1000L
+
+/** 何も選んでいない状態かどうか。起動直後の "" も含む。 */
+private fun isMoveTargetCleared(selectedTarget: String): Boolean =
+    selectedTarget.isEmpty() || selectedTarget == "none"
 
 /**
  * その移動先のボタンをいま押せるか。
- * 範囲を持たない（null）移動先と enabled = false の移動先は、位置に関係なく常に押せる。
+ * 何か選択している間は、どのボタンも押せる（選び直しを妨げないため）。
+ * 何も選んでいないときだけ、自己位置がそのボタンの範囲に入っているかで決まる。
+ */
+private fun canPressMoveTarget(
+    targetId: String,
+    selectedTarget: String,
+    unlockedTargets: Set<String>
+): Boolean =
+    !isMoveTargetCleared(selectedTarget) || targetId in unlockedTargets
+
+/**
+ * 自己位置がその移動先の範囲に入っているか。
+ * 範囲を持たない（null）移動先と enabled = false の移動先は、位置に関係なく常に範囲内とみなす。
  */
 private fun isMoveTargetUnlocked(
     target: MoveTarget,
@@ -1444,33 +1695,74 @@ private fun isMoveTargetUnlocked(
 }
 
 // 画面での並びをそのまま表す。内側の listOf 1つが 1 行分。
-// SELECT ボタンで送る順番。BS3 -> BS2 -> BS1 -> BS3 と一周する。
-private val BS_TARGET_CYCLE = listOf("bs3", "bs2", "bs1")
+// SELECT ボタンで送る順番。BS1 -> BS2 -> BS3 -> BS1 と一周する。
+private val BS_TARGET_CYCLE = listOf("bs1", "bs2", "bs3")
 
 // unlockArea の x / y（mm）・theta（度）がそのボタンを押せる場所。enabled = false でロックなし。
-private val MOVE_TARGET_ROWS = listOf(
+// 青ゾーン用。画面での並びもそのまま使う（各行とも 1 が右端に来るよう逆順、右詰めで表示）。
+private val BLUE_MOVE_TARGET_ROWS = listOf(
     listOf(
-        MoveTarget("tb1", "TB1", UnlockArea(3300f, 3000f, 0f, enabled = true)),
-        MoveTarget("tb2", "TB2", UnlockArea(3300f, 8645f, 0f, enabled = true))
-    ),
-    listOf(
-        MoveTarget("bs1", "BS1", UnlockArea(5000f, 4060f, 0f, enabled = true)),
+        MoveTarget("bs3", "BS3", UnlockArea(5000f, 3900f, 0f, enabled = true)),
         MoveTarget("bs2", "BS2", UnlockArea(5000f, 3980f, 0f, enabled = true)),
-        MoveTarget("bs3", "BS3", UnlockArea(5000f, 3900f, 0f, enabled = true))
+        MoveTarget("bs1", "BS1", UnlockArea(5000f, 4060f, 0f, enabled = true))
     ),
     listOf(
-        MoveTarget("hata", "HATA", UnlockArea(4260f, 6100f, 0f, enabled = true)),
-        MoveTarget("hoju", "HOJU", UnlockArea(4080f, 500f, 0f, enabled = true))
+        // 座標は仮置き（HATA と同じ）。実機に合わせて書き換える。
+        MoveTarget("tb2", "TB2", UnlockArea(3300f, 8645f, 0f, enabled = true)),
+        MoveTarget("tb1", "TB1", UnlockArea(3300f, 3000f, 0f, enabled = true)),
+        MoveTarget("dekahata", "DEKAHATA", UnlockArea(4260f, 6100f, 0f, enabled = true)),
+        
+    ),
+    
+    listOf(
+        // 座標は仮置き（HOJU と同じ）でロックも切ってある。実機に合わせて書き換えて enabled = true にする。
+        MoveTarget("dekahoju", "DEKAHOJU", UnlockArea(4080f, 500f, -90f, enabled = true)),
+        MoveTarget("hoju", "HOJU", UnlockArea(4080f, 500f, 0f, enabled = true)),
+        MoveTarget("hata", "HATA", UnlockArea(5020f, 5020f, 0.22f, enabled = true))
     )
 )
 
+// 赤ゾーン用。フィールドが左右反転するので、各行を青の逆順（1 が左端）に並べ、左詰めで表示する。
+// 並び・ラベル・座標とも青とは独立に書き換えられる。
+private val RED_MOVE_TARGET_ROWS = listOf(
+    listOf(
+        MoveTarget("tb1", "TB1", UnlockArea(3300f, -3000f, 0f, enabled = true)),
+        MoveTarget("tb2", "TB2", UnlockArea(3300f, -8645f, 0f, enabled = true)),
+        // 座標は仮置き（HATA と同じ）。実機に合わせて書き換える。
+        MoveTarget("dekahata", "DEKAHATA", UnlockArea(4260f, -6100f, 0f, enabled = true))
+    ),
+    listOf(
+        MoveTarget("bs1", "BS1", UnlockArea(5000f, -4060f, 0f, enabled = true)),
+        MoveTarget("bs2", "BS2", UnlockArea(5000f, -3980f, 0f, enabled = true)),
+        MoveTarget("bs3", "BS3", UnlockArea(5000f, -3900f, 0f, enabled = true))
+    ),
+    listOf(
+        MoveTarget("hata", "HATA", UnlockArea(4260f, -6100f, 0f, enabled = true)),
+        MoveTarget("hoju", "HOJU", UnlockArea(4080f, -500f, 0f, enabled = true)),
+        MoveTarget("dekahoju", "DEKAHOJU", UnlockArea(4080f, -500f, 90f, enabled = true))
+    )
+)
+
+/** サイド（"redmap" / "bluemap"）に応じた移動先の並び。 */
+private fun moveTargetRowsFor(mapId: String): List<List<MoveTarget>> =
+    if (mapId == "redmap") RED_MOVE_TARGET_ROWS else BLUE_MOVE_TARGET_ROWS
+
 // ローをターゲット id で引けるようにしたもの。毎回 flatten() しないため。
-private val MOVE_TARGETS = MOVE_TARGET_ROWS.flatten()
+private val RED_MOVE_TARGETS = RED_MOVE_TARGET_ROWS.flatten()
+private val BLUE_MOVE_TARGETS = BLUE_MOVE_TARGET_ROWS.flatten()
+
+private fun moveTargetsFor(mapId: String): List<MoveTarget> =
+    if (mapId == "redmap") RED_MOVE_TARGETS else BLUE_MOVE_TARGETS
 
 @Composable
 fun ControllerUI(
     isFlipped: Boolean,
+    // 起動時に Wi-Fi / モバイル回線がつながっていたら true。背景の点滅と警告を出す。
+    networkWarning: Boolean,
     rttList: List<Long>,
+    // PING_HOST への ping の最新結果（"12.3 ms" / "TIMEOUT" など）。pingOk = false なら赤。
+    pingText: String,
+    pingOk: Boolean,
     posX: Double,
     posY: Double,
     posTheta: Double,
@@ -1491,6 +1783,7 @@ fun ControllerUI(
     onSelectObject: (String) -> Unit,
     selectedTarget: String,
     onSelectTarget: (String) -> Unit,
+    unlockedTargets: Set<String>,
     hataLaser: Boolean,
     onHataLaser: () -> Unit,
     hojuLaser: Boolean,
@@ -1505,27 +1798,32 @@ fun ControllerUI(
     onSpeedDecrease: (column: Int) -> Unit,
     logList: List<String>,
     hojuState: String,
-    t0locked: Boolean
+    t0locked: Boolean,
+    // con.py から turn / speed を受け取るまでは false。その間は調整ボタンを無効にする。
+    settingsSynced: Boolean
 ) {
     val imageBitmap = ImageBitmap.imageResource(id = R.drawable.blackarrow)
     Box(
         modifier = Modifier
             .fillMaxSize()
             .rotate(if (isFlipped) 180f else 0f)
-            .background(ControllerColors.Background),
+            .background(screenBackground(networkWarning)),
     ) {
+        if (networkWarning) NetworkWarningBanner(Modifier.align(Alignment.TopCenter))
         // 移動先の一覧。常に1つ点灯して "target" を送り続け、L3 / R3 でのみ "none" に戻る。
         HudPanel(modifier = Modifier.width(340.dp).offset(x=122.dp,).zIndex(1f), accent = ControllerColors.Accent) {
             HudSectionTitle("MOVE TARGET  /  ${if (selectedTarget == "none") "---" else selectedTarget.uppercase()}", ControllerColors.Accent, 12.sp)
-            // 赤ゾーンはフィールドが左右反転するので、ボタンの並びも行ごと横方向に反転させる。
-            val moveTargetRows = remember(mapID) {
-                if (mapID == "redmap") MOVE_TARGET_ROWS.map { it.reversed() } else MOVE_TARGET_ROWS
-            }
+            // 並びと座標は赤 / 青それぞれの定義（RED_ / BLUE_MOVE_TARGET_ROWS）を使う。
+            val moveTargetRows = moveTargetRowsFor(mapID)
             Column(
                 modifier = Modifier
+                    .fillMaxWidth()
                     .height(136.dp)
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                // 青は 1 が右端に来るよう右詰め、赤はその左右反転で左詰め。行の中身の順番は定義側で決めてある
+                // （ボタン数の少ない行も赤青で鏡写しの位置に来る）。
+                horizontalAlignment = if (mapID == "redmap") Alignment.Start else Alignment.End
             ) {
                 moveTargetRows.forEach { rowTargets ->
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1533,8 +1831,8 @@ fun ControllerUI(
                             MoveTargetButton(
                                 label = target.label,
                                 selected = selectedTarget == target.id,
-                                // 付近に居ない間はロックして押せなくする。
-                                enabled = isMoveTargetUnlocked(target, posX, posY, posTheta),
+                                // 何も選んでいない間だけ、付近に居ないボタンをロックする。
+                                enabled = canPressMoveTarget(target.id, selectedTarget, unlockedTargets),
                                 onClick = { onSelectTarget(target.id) }
                             )
                         }
@@ -1594,7 +1892,7 @@ fun ControllerUI(
 
                 withTransform({
                     translate(translateX, translateY)
-                    rotate(degrees = -angleDegrees + 180f, pivot = Offset.Zero)
+                    rotate(degrees = -angleDegrees - 90f, pivot = Offset.Zero)
                     scale(scaleX = 0.15f, scaleY = 0.15f, pivot = Offset.Zero)
                 }) {
                     drawImage(
@@ -1640,7 +1938,7 @@ fun ControllerUI(
                 Box(
                     modifier = Modifier
                         .width(140.dp)
-                        .height(150.dp)
+                        .height(130.dp)
                         .background(ControllerColors.Background, RoundedCornerShape(5.dp))
                         .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
                         .padding(5.dp)
@@ -1657,11 +1955,12 @@ fun ControllerUI(
                     }
                 }
 
+                // PING の欄を入れるぶん、NETWORK RTT の枠を 120dp から縮めてある。
                 HudSectionTitle("NETWORK RTT")
                 Box(
                     modifier = Modifier
                         .width(140.dp)
-                        .height(120.dp)
+                        .height(30.dp)
                         .background(ControllerColors.Background, RoundedCornerShape(5.dp))
                         .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
                         .padding(5.dp)
@@ -1671,6 +1970,26 @@ fun ControllerUI(
                             Text("$rtt ms", color = ControllerColors.Success, fontSize = 10.sp)
                         }
                     }
+                }
+
+                // 宛先の下2つ（"192.168.11.1" -> "11.1"）だけ出す。
+                HudSectionTitle("PING ${PING_HOST.split('.').takeLast(2).joinToString(".")}")
+                Box(
+                    modifier = Modifier
+                        .width(140.dp)
+                        .height(30.dp)
+                        .background(ControllerColors.Background, RoundedCornerShape(5.dp))
+                        .border(1.dp, if (pingOk) ControllerColors.Border else ControllerColors.Danger, RoundedCornerShape(5.dp))
+                        .padding(horizontal = 5.dp),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    Text(
+                        text = pingText,
+                        color = if (pingOk) ControllerColors.Success else ControllerColors.Danger,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
+                    )
                 }
             }
         }
@@ -1696,14 +2015,21 @@ fun ControllerUI(
                 else -> ControllerColors.Warning
             }
             HudPanel(modifier = Modifier.fillMaxWidth().weight(1f), accent = speedAccent) {
-                HudSectionTitle("SPEED ADJUST  /  ${objectDisplayName(selectedObject)}", speedAccent, 11.sp)
+                HudSectionTitle(
+                    if (settingsSynced) "SPEED ADJUST  /  ${objectDisplayName(selectedObject)}" else "SPEED ADJUST  /  SYNC...",
+                    if (settingsSynced) speedAccent else ControllerColors.Danger,
+                    11.sp
+                )
                 Column(
                     modifier = Modifier.fillMaxHeight(),
                     verticalArrangement = Arrangement.SpaceEvenly
                 ) {
+                    val speedRange = speedRangeFor(selectedObject)
                     SpeedAdjustRow(
                         label = "C1",
                         value = speed1,
+                        range = speedRange,
+                        enabled = settingsSynced,
                         onIncrease = { onSpeedIncrease(1) },
                         onDecrease = { onSpeedDecrease(1) },
                         accent = speedAccent
@@ -1711,6 +2037,8 @@ fun ControllerUI(
                     SpeedAdjustRow(
                         label = "C2",
                         value = speed2,
+                        range = speedRange,
+                        enabled = settingsSynced,
                         onIncrease = { onSpeedIncrease(2) },
                         onDecrease = { onSpeedDecrease(2) },
                         accent = speedAccent
@@ -1718,6 +2046,8 @@ fun ControllerUI(
                     SpeedAdjustRow(
                         label = "C3",
                         value = speed3,
+                        range = speedRange,
+                        enabled = settingsSynced,
                         onIncrease = { onSpeedIncrease(3) },
                         onDecrease = { onSpeedDecrease(3) },
                         accent = speedAccent
@@ -1769,7 +2099,11 @@ fun ControllerUI(
                 .offset(498.dp, 182.dp),
             accent = ControllerColors.Warning
         ) {
-            HudSectionTitle("TURN ADJUST  /  ${selectedTurnTarget.displayName()}", ControllerColors.Warning, 10.sp)
+            HudSectionTitle(
+                if (settingsSynced) "TURN ADJUST  /  ${selectedTurnTarget.displayName()}" else "TURN ADJUST  /  SYNC...",
+                if (settingsSynced) ControllerColors.Warning else ControllerColors.Danger,
+                10.sp
+            )
             Text("BAKETU X ${"%.2f".format(baketuTurnX)} Y ${"%.2f".format(baketuTurnY)} T ${"%.2f".format(baketuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
             Text("HATA   X ${"%.2f".format(hataTurnX)} Y ${"%.2f".format(hataTurnY)} T ${"%.2f".format(hataTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
             Text("HOJU   X ${"%.2f".format(hojuTurnX)} Y ${"%.2f".format(hojuTurnY)} T ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
@@ -1780,14 +2114,14 @@ fun ControllerUI(
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .padding(100.dp)
-                .width(130.dp).height(70.dp)
-                .offset(390.dp, 70.dp),
+                .width(145.dp).height(70.dp)
+                .offset(395.dp, 70.dp),
             accent = ControllerColors.Success
         ) {
             Text(
                 text = if (hojuState.isBlank()) "---" else hojuState,
                 color = ControllerColors.TextPrimary,
-                fontSize = 40.sp,
+                fontSize = 25.sp,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1
             )
@@ -1875,20 +2209,63 @@ private fun MoveTargetButton(
     enabled: Boolean,
     onClick: () -> Unit
 ) {
-    HudButton(
-        text = label,
+    // 選択中 = 緑ベタ塗り + 白枠 / 押せる = 水色ベタ塗り / ロック中 = 黒く沈めて取り消し線 + LOCKED。
+    // 押せる / 押せないは塗りの有無で遠目にも分かるようにしてある。
+    val shape = RoundedCornerShape(7.dp)
+    val containerColor = when {
+        selected -> ControllerColors.Success
+        enabled -> ControllerColors.Accent
+        else -> ControllerColors.Background
+    }
+    val contentColor = if (enabled) ControllerColors.Background else ControllerColors.TextMuted.copy(alpha = 0.5f)
+    val borderColor = when {
+        selected -> ControllerColors.TextPrimary
+        enabled -> ControllerColors.Accent
+        else -> ControllerColors.Surface2
+    }
+    Button(
         onClick = onClick,
-        modifier = Modifier.width(100.dp),
         enabled = enabled,
-        containerColor = if (selected) Color(0xFF124D37) else ControllerColors.Surface2,
-        contentColor = if (selected) ControllerColors.Success else ControllerColors.TextSecondary,
-        height = 42.dp,
-        fontSize = 12.sp,
-        // ロック中は枠も落として、押せないことが一目で分かるようにする。
-        accent = when {
-            !enabled -> ControllerColors.Neutral
-            selected -> ControllerColors.Success
-            else -> ControllerColors.Border
+        modifier = Modifier.width(100.dp).height(42.dp),
+        shape = shape,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = containerColor,
+            contentColor = contentColor,
+            disabledContainerColor = containerColor,
+            disabledContentColor = contentColor
+        ),
+        elevation = ButtonDefaults.buttonElevation(
+            defaultElevation = 0.dp,
+            pressedElevation = 0.dp,
+            focusedElevation = 0.dp,
+            hoveredElevation = 0.dp,
+            disabledElevation = 0.dp
+        ),
+        contentPadding = PaddingValues(0.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .border(if (selected) 3.dp else 1.dp, borderColor, shape),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = label,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = contentColor,
+                textDecoration = if (enabled) null else TextDecoration.LineThrough
+            )
+            if (!enabled) {
+                Text(
+                    text = "LOCKED",
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = ControllerColors.Danger.copy(alpha = 0.7f),
+                    letterSpacing = 1.sp
+                )
+            }
         }
-    )
+    }
 }
