@@ -79,7 +79,8 @@ enum class ScreenState {
 enum class TurnTarget {
     HATA,
     HOJU,
-    BAKETU
+    BAKETU,
+    DEKAHATA
 }
 
 // ???????????????? SPEED ADJUST ????????
@@ -150,6 +151,10 @@ class MainActivity : ComponentActivity() {
     private var baketu_turnx by mutableStateOf(0.0f)
     private var baketu_turny by mutableStateOf(0.0f)
     private var baketu_turntheta by mutableStateOf(0.0f)
+    // デカ雑巾を旗に撃つとき用の turn 調整値。MOVE TARGET で dekahata を選んでいるときの対象。
+    private var dekahata_turnx by mutableStateOf(0.0f)
+    private var dekahata_turny by mutableStateOf(0.0f)
+    private var dekahata_turntheta by mutableStateOf(0.0f)
 
     // t0
     private var t0 by mutableStateOf(false)
@@ -317,7 +322,7 @@ class MainActivity : ComponentActivity() {
             val currentL2 = rawL2 > 0.5f
             val currentR2 = rawR2 > 0.5f
 
-            if (selectedTurnTarget == TurnTarget.HATA) {
+            if (selectedTurnTarget.usesHoldRepeat()) {
                 // ?????????????1????????????Job?????
                 val pressedNow = currentDpadLeft || currentDpadRight || currentDpadUp ||
                         currentDpadDown || currentL2 || currentR2
@@ -405,7 +410,7 @@ class MainActivity : ComponentActivity() {
             while (isActive) {
                 delay(hataTurnRepeatIntervalMs)
 
-                if (selectedTurnTarget != TurnTarget.HATA) break
+                if (!selectedTurnTarget.usesHoldRepeat()) break
 
                 val dpadLeft = left
                 val dpadRight = right
@@ -535,6 +540,9 @@ class MainActivity : ComponentActivity() {
         baketu_turnx = f("baketu_turnx", baketu_turnx)
         baketu_turny = f("baketu_turny", baketu_turny)
         baketu_turntheta = f("baketu_turntheta", baketu_turntheta)
+        dekahata_turnx = f("dekahata_turnx", dekahata_turnx)
+        dekahata_turny = f("dekahata_turny", dekahata_turny)
+        dekahata_turntheta = f("dekahata_turntheta", dekahata_turntheta)
         hataSpeed1 = f("hata_speed1", hataSpeed1)
         hataSpeed2 = f("hata_speed2", hataSpeed2)
         hataSpeed3 = f("hata_speed3", hataSpeed3)
@@ -569,6 +577,9 @@ class MainActivity : ComponentActivity() {
         baketu_turnx = loadSideFloat(mapId, "baketu_turnx", 0.0f)
         baketu_turny = loadSideFloat(mapId, "baketu_turny", 0.0f)
         baketu_turntheta = loadSideFloat(mapId, "baketu_turntheta", 0.0f)
+        dekahata_turnx = loadSideFloat(mapId, "dekahata_turnx", 0.0f)
+        dekahata_turny = loadSideFloat(mapId, "dekahata_turny", 0.0f)
+        dekahata_turntheta = loadSideFloat(mapId, "dekahata_turntheta", 0.0f)
         hataSpeed1 = loadSideFloat(mapId, "hata_speed1", 10.2f)
         hataSpeed2 = loadSideFloat(mapId, "hata_speed2", 10.2f)
         hataSpeed3 = loadSideFloat(mapId, "hata_speed3", 10.2f)
@@ -595,6 +606,9 @@ class MainActivity : ComponentActivity() {
             .putFloat("${mapId}_baketu_turnx", baketu_turnx)
             .putFloat("${mapId}_baketu_turny", baketu_turny)
             .putFloat("${mapId}_baketu_turntheta", baketu_turntheta)
+            .putFloat("${mapId}_dekahata_turnx", dekahata_turnx)
+            .putFloat("${mapId}_dekahata_turny", dekahata_turny)
+            .putFloat("${mapId}_dekahata_turntheta", dekahata_turntheta)
             .putFloat("${mapId}_hata_speed1", hataSpeed1)
             .putFloat("${mapId}_hata_speed2", hataSpeed2)
             .putFloat("${mapId}_hata_speed3", hataSpeed3)
@@ -687,6 +701,7 @@ class MainActivity : ComponentActivity() {
                         hataTurnX = hata_turnx, hataTurnY = hata_turny, hataTurnTheta = hata_turntheta,
                         hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
                         baketuTurnX = baketu_turnx, baketuTurnY = baketu_turny, baketuTurnTheta = baketu_turntheta,
+                        dekahataTurnX = dekahata_turnx, dekahataTurnY = dekahata_turny, dekahataTurnTheta = dekahata_turntheta,
                         selectedTurnTarget = selectedTurnTarget,
                         t0 = t0,
                         onToggleT0 = { toggleT0() },
@@ -863,6 +878,7 @@ class MainActivity : ComponentActivity() {
                     hata_turnx, hata_turny, hata_turntheta,
                     hoju_turnx, hoju_turny, hoju_turntheta,
                     baketu_turnx, baketu_turny, baketu_turntheta,
+                    dekahata_turnx, dekahata_turny, dekahata_turntheta,
                     mode = "normal",
                     selectedObject, selectedTarget,
                     hataLaser, hojuLaser, t0,
@@ -1004,9 +1020,9 @@ class MainActivity : ComponentActivity() {
                 // デカ補充のあとに旗へ向かうときはデカ雑巾を撃つので、OBJECT はデカ雑巾のまま残す。
                 if (selectedObject != "dekazoukin") selectedObject = "hata"
             }
-            // デカ雑巾を旗に撃ちに行く。turn / レーザーは hata と同じで、OBJECT は必ずデカ雑巾。
+            // デカ雑巾を旗に撃ちに行く。turn は専用の DEKAHATA、レーザーは hata と同じで、OBJECT は必ずデカ雑巾。
             "dekahata" -> {
-                setTurnTarget(TurnTarget.HATA)
+                setTurnTarget(TurnTarget.DEKAHATA)
                 hataLaser = true
                 selectedObject = "dekazoukin"
             }
@@ -1041,7 +1057,7 @@ class MainActivity : ComponentActivity() {
     private fun setTurnTarget(target: TurnTarget) {
         if (selectedTurnTarget == target) return
         selectedTurnTarget = target
-        if (target == TurnTarget.HATA) {
+        if (target.usesHoldRepeat()) {
             if (left || right || up || down || l2 || r2) {
                 startHataTurnRepeat()
             }
@@ -1094,6 +1110,11 @@ class MainActivity : ComponentActivity() {
                 baketu_turnx += dx
                 baketu_turny += dy
                 baketu_turntheta += dtheta
+            }
+            TurnTarget.DEKAHATA -> {
+                dekahata_turnx += dx
+                dekahata_turny += dy
+                dekahata_turntheta += dtheta
             }
         }
     }
@@ -1181,6 +1202,7 @@ class MainActivity : ComponentActivity() {
         hataTurnX: Float, hataTurnY: Float, hataTurnTheta: Float,
         hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
         baketuTurnX: Float, baketuTurnY: Float, baketuTurnTheta: Float,
+        dekahataTurnX: Float, dekahataTurnY: Float, dekahataTurnTheta: Float,
         mode: String,
         selectedObject: String, selectedTarget: String,
         hataLaser: Boolean, hojuLaser: Boolean, t0: Boolean,
@@ -1191,7 +1213,7 @@ class MainActivity : ComponentActivity() {
         synced: Boolean
     ) {
         try {
-            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed1":$hataSpeed1,"baketu_speed1":$baketuSpeed1,"hata_speed2":$hataSpeed2,"baketu_speed2":$baketuSpeed2,"hata_speed3":$hataSpeed3,"baketu_speed3":$baketuSpeed3,"dekazoukin_speed1":$dekazoukinSpeed1,"dekazoukin_speed2":$dekazoukinSpeed2,"dekazoukin_speed3":$dekazoukinSpeed3,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"mode":"$mode","object":"$selectedObject","target":"$selectedTarget","hatalaser":$hataLaser,"hojulaser":$hojuLaser,"t0":$t0,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2,"start":$start,"select":$select,"ps":$ps,"synced":$synced}"""
+            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed1":$hataSpeed1,"baketu_speed1":$baketuSpeed1,"hata_speed2":$hataSpeed2,"baketu_speed2":$baketuSpeed2,"hata_speed3":$hataSpeed3,"baketu_speed3":$baketuSpeed3,"dekazoukin_speed1":$dekazoukinSpeed1,"dekazoukin_speed2":$dekazoukinSpeed2,"dekazoukin_speed3":$dekazoukinSpeed3,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"dekahata_turnx":$dekahataTurnX,"dekahata_turny":$dekahataTurnY,"dekahata_turntheta":$dekahataTurnTheta,"mode":"$mode","object":"$selectedObject","target":"$selectedTarget","hatalaser":$hataLaser,"hojulaser":$hojuLaser,"t0":$t0,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2,"start":$start,"select":$select,"ps":$ps,"synced":$synced}"""
             val buf = msg.toByteArray()
             val packet = DatagramPacket(buf, buf.size, address, port)
             sendTime = System.nanoTime()
@@ -1773,6 +1795,7 @@ fun ControllerUI(
     hataTurnX: Float, hataTurnY: Float, hataTurnTheta: Float,
     hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
     baketuTurnX: Float, baketuTurnY: Float, baketuTurnTheta: Float,
+    dekahataTurnX: Float, dekahataTurnY: Float, dekahataTurnTheta: Float,
     selectedTurnTarget: TurnTarget,
     t0: Boolean,
     onToggleT0: () -> Unit,
@@ -2107,6 +2130,7 @@ fun ControllerUI(
             Text("BAKETU X ${"%.2f".format(baketuTurnX)} Y ${"%.2f".format(baketuTurnY)} T ${"%.2f".format(baketuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
             Text("HATA   X ${"%.2f".format(hataTurnX)} Y ${"%.2f".format(hataTurnY)} T ${"%.2f".format(hataTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
             Text("HOJU   X ${"%.2f".format(hojuTurnX)} Y ${"%.2f".format(hojuTurnY)} T ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
+            Text("DKHATA X ${"%.2f".format(dekahataTurnX)} Y ${"%.2f".format(dekahataTurnY)} T ${"%.2f".format(dekahataTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
         }
 
         // ロボットから受け取った hojustate 表示（旧 t0 ボタンの位置）
@@ -2176,7 +2200,12 @@ fun TurnTarget.displayName(): String = when (this) {
     TurnTarget.HATA -> "HATA"
     TurnTarget.HOJU -> "HOJU"
     TurnTarget.BAKETU -> "BAKETU"
+    TurnTarget.DEKAHATA -> "DEKAHATA"
 }
+
+/** 押しっぱなしで連続調整する対象か。旗を狙う HATA / DEKAHATA が対象。 */
+private fun TurnTarget.usesHoldRepeat(): Boolean =
+    this == TurnTarget.HATA || this == TurnTarget.DEKAHATA
 
 /** send() ?????? "object" ?????????????? */
 private fun objectDisplayName(id: String): String =
