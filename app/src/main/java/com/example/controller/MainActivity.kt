@@ -77,11 +77,9 @@ enum class ScreenState {
 }
 
 enum class TurnTarget {
-    HATAT,
-    HATAO,
+    HATA,
     HOJU,
-    BAKETU,
-    DEKAHATA
+    BAKETU
 }
 
 // ???????????????? SPEED ADJUST ????????
@@ -142,24 +140,17 @@ class MainActivity : ComponentActivity() {
     // robot??????hojustate:xxxxxxx??????????????????
     private var hojuState by mutableStateOf("")
     // turn???
-    // 旗用の turn 調整値。MOVE TARGET の hatat / hatao それぞれで別に持つ。
-    private var hatat_turnx by mutableStateOf(0.0f)
-    private var hatat_turny by mutableStateOf(0.0f)
-    private var hatat_turntheta by mutableStateOf(0.0f)
-    private var hatao_turnx by mutableStateOf(0.0f)
-    private var hatao_turny by mutableStateOf(0.0f)
-    private var hatao_turntheta by mutableStateOf(0.0f)
+    // 旗用の turn 調整値。MOVE TARGET で hata を選んでいるときの対象。
+    private var hata_turnx by mutableStateOf(0.0f)
+    private var hata_turny by mutableStateOf(0.0f)
+    private var hata_turntheta by mutableStateOf(0.0f)
     private var hoju_turnx by mutableStateOf(0.0f)
     private var hoju_turny by mutableStateOf(0.0f)
     private var hoju_turntheta by mutableStateOf(0.0f)
-    // バケツ用の turn 調整値。MOVE TARGET で BS 系（bs1 / bs2 / bs3）を選んでいるときの対象。
+    // バケツ用の turn 調整値。MOVE TARGET で BS 系（BS_TARGETS）を選んでいるときの対象。
     private var baketu_turnx by mutableStateOf(0.0f)
     private var baketu_turny by mutableStateOf(0.0f)
     private var baketu_turntheta by mutableStateOf(0.0f)
-    // デカ雑巾を旗に撃つとき用の turn 調整値。MOVE TARGET で dekahata を選んでいるときの対象。
-    private var dekahata_turnx by mutableStateOf(0.0f)
-    private var dekahata_turny by mutableStateOf(0.0f)
-    private var dekahata_turntheta by mutableStateOf(0.0f)
 
     // t0
     private var t0 by mutableStateOf(false)
@@ -205,7 +196,7 @@ class MainActivity : ComponentActivity() {
     private var isFlipped by mutableStateOf(true)
 
     // turn????
-    private var selectedTurnTarget by mutableStateOf(TurnTarget.HATAT)
+    private var selectedTurnTarget by mutableStateOf(TurnTarget.HATA)
 
     // turn???1????????
     private val turnXYStep = 2f
@@ -456,7 +447,7 @@ class MainActivity : ComponentActivity() {
                     return true
                 }
                 KeyEvent.KEYCODE_BUTTON_START -> { start = true; return true }
-                // SELECT ボタンで、選択中の移動先に応じて BS1 -> BS2 -> BS3 -> BS1 か HATAT <-> HATAO を切り替える
+                // SELECT ボタンで、BS 系を選んでいれば BS ボタンを押したときと同じく次へ送る
                 KeyEvent.KEYCODE_BUTTON_SELECT -> {
                     select = true
                     if (event.repeatCount == 0) {
@@ -536,22 +527,16 @@ class MainActivity : ComponentActivity() {
         if (mapId != loadedSettingsMapID || settingsSynced) return
         fun f(name: String, current: Float): Float =
             settings.optDouble(name, current.toDouble()).toFloat()
-        // hatat / hatao のキーがまだ無い（分ける前の）設定値なら、共用だった hata_turn* を両方に入れる。
-        hatat_turnx = f("hatat_turnx", f("hata_turnx", hatat_turnx))
-        hatat_turny = f("hatat_turny", f("hata_turny", hatat_turny))
-        hatat_turntheta = f("hatat_turntheta", f("hata_turntheta", hatat_turntheta))
-        hatao_turnx = f("hatao_turnx", f("hata_turnx", hatao_turnx))
-        hatao_turny = f("hatao_turny", f("hata_turny", hatao_turny))
-        hatao_turntheta = f("hatao_turntheta", f("hata_turntheta", hatao_turntheta))
+        // hata_turn* がまだ無い（hatat / hatao に分けていた頃の）設定値なら、hatat_turn* を引き継ぐ。
+        hata_turnx = f("hata_turnx", f("hatat_turnx", hata_turnx))
+        hata_turny = f("hata_turny", f("hatat_turny", hata_turny))
+        hata_turntheta = f("hata_turntheta", f("hatat_turntheta", hata_turntheta))
         hoju_turnx = f("hoju_turnx", hoju_turnx)
         hoju_turny = f("hoju_turny", hoju_turny)
         hoju_turntheta = f("hoju_turntheta", hoju_turntheta)
         baketu_turnx = f("baketu_turnx", baketu_turnx)
         baketu_turny = f("baketu_turny", baketu_turny)
         baketu_turntheta = f("baketu_turntheta", baketu_turntheta)
-        dekahata_turnx = f("dekahata_turnx", dekahata_turnx)
-        dekahata_turny = f("dekahata_turny", dekahata_turny)
-        dekahata_turntheta = f("dekahata_turntheta", dekahata_turntheta)
         hataSpeed1 = f("hata_speed1", hataSpeed1)
         hataSpeed2 = f("hata_speed2", hataSpeed2)
         hataSpeed3 = f("hata_speed3", hataSpeed3)
@@ -577,25 +562,17 @@ class MainActivity : ComponentActivity() {
 
     /** 選んだサイドの turn 調整値と射出速度を読み込む。 */
     private fun loadSettings(mapId: String) {
-        // hatat / hatao に分ける前は hata_turn* を共用していたので、新しいキーが無ければその値を引き継ぐ。
-        val oldHataTurnX = loadSideFloat(mapId, "hata_turnx", 0.0f)
-        val oldHataTurnY = loadSideFloat(mapId, "hata_turny", 0.0f)
-        val oldHataTurnTheta = loadSideFloat(mapId, "hata_turntheta", 0.0f)
-        hatat_turnx = loadSideFloat(mapId, "hatat_turnx", oldHataTurnX)
-        hatat_turny = loadSideFloat(mapId, "hatat_turny", oldHataTurnY)
-        hatat_turntheta = loadSideFloat(mapId, "hatat_turntheta", oldHataTurnTheta)
-        hatao_turnx = loadSideFloat(mapId, "hatao_turnx", oldHataTurnX)
-        hatao_turny = loadSideFloat(mapId, "hatao_turny", oldHataTurnY)
-        hatao_turntheta = loadSideFloat(mapId, "hatao_turntheta", oldHataTurnTheta)
+        // hatat / hatao に分けていた頃の hatat_turn* が残っていれば、それを hata_turn* として引き継ぐ。
+        // （分ける前の hata_turn* は古いので、hatat が残っている間は使わない。hatat は saveSettings で消す）
+        hata_turnx = loadSideFloat(mapId, "hatat_turnx", loadSideFloat(mapId, "hata_turnx", 0.0f))
+        hata_turny = loadSideFloat(mapId, "hatat_turny", loadSideFloat(mapId, "hata_turny", 0.0f))
+        hata_turntheta = loadSideFloat(mapId, "hatat_turntheta", loadSideFloat(mapId, "hata_turntheta", 0.0f))
         hoju_turnx = loadSideFloat(mapId, "hoju_turnx", 0.0f)
         hoju_turny = loadSideFloat(mapId, "hoju_turny", 0.0f)
         hoju_turntheta = loadSideFloat(mapId, "hoju_turntheta", 0.0f)
         baketu_turnx = loadSideFloat(mapId, "baketu_turnx", 0.0f)
         baketu_turny = loadSideFloat(mapId, "baketu_turny", 0.0f)
         baketu_turntheta = loadSideFloat(mapId, "baketu_turntheta", 0.0f)
-        dekahata_turnx = loadSideFloat(mapId, "dekahata_turnx", 0.0f)
-        dekahata_turny = loadSideFloat(mapId, "dekahata_turny", 0.0f)
-        dekahata_turntheta = loadSideFloat(mapId, "dekahata_turntheta", 0.0f)
         hataSpeed1 = loadSideFloat(mapId, "hata_speed1", 10.2f)
         hataSpeed2 = loadSideFloat(mapId, "hata_speed2", 10.2f)
         hataSpeed3 = loadSideFloat(mapId, "hata_speed3", 10.2f)
@@ -613,21 +590,26 @@ class MainActivity : ComponentActivity() {
     private fun saveSettings() {
         val mapId = loadedSettingsMapID ?: return
         prefs.edit()
-            .putFloat("${mapId}_hatat_turnx", hatat_turnx)
-            .putFloat("${mapId}_hatat_turny", hatat_turny)
-            .putFloat("${mapId}_hatat_turntheta", hatat_turntheta)
-            .putFloat("${mapId}_hatao_turnx", hatao_turnx)
-            .putFloat("${mapId}_hatao_turny", hatao_turny)
-            .putFloat("${mapId}_hatao_turntheta", hatao_turntheta)
+            .putFloat("${mapId}_hata_turnx", hata_turnx)
+            .putFloat("${mapId}_hata_turny", hata_turny)
+            .putFloat("${mapId}_hata_turntheta", hata_turntheta)
+            // hata に引き継ぎ済みなので、hatat / hatao に分けていた頃のキーは消す。
+            .remove("${mapId}_hatat_turnx")
+            .remove("${mapId}_hatat_turny")
+            .remove("${mapId}_hatat_turntheta")
+            .remove("${mapId}_hatao_turnx")
+            .remove("${mapId}_hatao_turny")
+            .remove("${mapId}_hatao_turntheta")
+            // DEKAHATA はなくしたので、その turn 調整値も消す。
+            .remove("${mapId}_dekahata_turnx")
+            .remove("${mapId}_dekahata_turny")
+            .remove("${mapId}_dekahata_turntheta")
             .putFloat("${mapId}_hoju_turnx", hoju_turnx)
             .putFloat("${mapId}_hoju_turny", hoju_turny)
             .putFloat("${mapId}_hoju_turntheta", hoju_turntheta)
             .putFloat("${mapId}_baketu_turnx", baketu_turnx)
             .putFloat("${mapId}_baketu_turny", baketu_turny)
             .putFloat("${mapId}_baketu_turntheta", baketu_turntheta)
-            .putFloat("${mapId}_dekahata_turnx", dekahata_turnx)
-            .putFloat("${mapId}_dekahata_turny", dekahata_turny)
-            .putFloat("${mapId}_dekahata_turntheta", dekahata_turntheta)
             .putFloat("${mapId}_hata_speed1", hataSpeed1)
             .putFloat("${mapId}_hata_speed2", hataSpeed2)
             .putFloat("${mapId}_hata_speed3", hataSpeed3)
@@ -717,11 +699,9 @@ class MainActivity : ComponentActivity() {
                         currentVx = if (lowGain) vy / 2f else vy,
                         currentVy = if (lowGain) vx / 2f else vx,
                         currentW = if (lowGain) w / 2f else w,
-                        hatatTurnX = hatat_turnx, hatatTurnY = hatat_turny, hatatTurnTheta = hatat_turntheta,
-                        hataoTurnX = hatao_turnx, hataoTurnY = hatao_turny, hataoTurnTheta = hatao_turntheta,
+                        hataTurnX = hata_turnx, hataTurnY = hata_turny, hataTurnTheta = hata_turntheta,
                         hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
                         baketuTurnX = baketu_turnx, baketuTurnY = baketu_turny, baketuTurnTheta = baketu_turntheta,
-                        dekahataTurnX = dekahata_turnx, dekahataTurnY = dekahata_turny, dekahataTurnTheta = dekahata_turntheta,
                         selectedTurnTarget = selectedTurnTarget,
                         t0 = t0,
                         onToggleT0 = { toggleT0() },
@@ -895,11 +875,9 @@ class MainActivity : ComponentActivity() {
                     hataSpeed2, baketuSpeed2,
                     hataSpeed3, baketuSpeed3,
                     dekazoukinSpeed1, dekazoukinSpeed2, dekazoukinSpeed3,
-                    hatat_turnx, hatat_turny, hatat_turntheta,
-                    hatao_turnx, hatao_turny, hatao_turntheta,
+                    hata_turnx, hata_turny, hata_turntheta,
                     hoju_turnx, hoju_turny, hoju_turntheta,
                     baketu_turnx, baketu_turny, baketu_turntheta,
-                    dekahata_turnx, dekahata_turny, dekahata_turntheta,
                     mode = "normal",
                     selectedObject, selectedTarget,
                     hataLaser, hojuLaser, t0,
@@ -971,6 +949,8 @@ class MainActivity : ComponentActivity() {
                     val normalLines = mutableListOf<String>()
                     var latestHojuState: String? = null
                     var invalidTarget = false
+                    // "Move_Target:HBO" のように移動先の切り替えを頼まれたら、その id（小文字）。
+                    var requestedTarget: String? = null
 
                     receivedLog.split("\n")
                         .map { it.trim() }
@@ -979,6 +959,11 @@ class MainActivity : ComponentActivity() {
                             // ロボットが移動先を受け付けなかった合図。ログにも残す。
                             if (line.contains("invalid_target", ignoreCase = true)) {
                                 invalidTarget = true
+                            }
+                            // ロボットからの移動先の切り替え。受け付けるのは LOG_SWITCHABLE_TARGETS だけ。ログにも残す。
+                            if (line.startsWith(MOVE_TARGET_LOG_PREFIX, ignoreCase = true)) {
+                                val id = line.substring(MOVE_TARGET_LOG_PREFIX.length).trim().lowercase()
+                                if (id in LOG_SWITCHABLE_TARGETS) requestedTarget = id
                             }
                             if (line.startsWith("hojustate:")) {
                                 // 画面には "hojustate:" を外した中身だけを出す。
@@ -989,10 +974,11 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                    if (latestHojuState != null || normalLines.isNotEmpty() || invalidTarget) {
+                    if (latestHojuState != null || normalLines.isNotEmpty() || invalidTarget || requestedTarget != null) {
                         runOnUiThread {
                             // invalid_target が来たら、何を選んでいても MOVE TARGET を解除する。
                             if (invalidTarget) clearMoveTarget()
+                            requestedTarget?.let { switchMoveTargetFromLog(it) }
                             latestHojuState?.let { hojuState = it }
                             if (normalLines.isNotEmpty()) {
                                 logList = (logList + normalLines).takeLast(50)
@@ -1013,51 +999,74 @@ class MainActivity : ComponentActivity() {
      * （L3 / R3 で "none" に戻すか、他の移動先を選めば固定は解ける）
      */
     /**
-     * MOVE TARGET の選択。hatat・hatao / hoju なら turn 調整の対象もそれに合わせる。
+     * MOVE TARGET の選択。hata / hoju なら turn 調整の対象もそれに合わせる。
      * 選択中のボタンをもう一度押すと解除する（L3 / R3 と同じ扱い）。
-     * hatat・hatao / hoju に切り替わったときは、対応するレーザーを1回だけ ON にする
+     * ただし CYCLING_MOVE_TARGETS のボタン（BS2 / BS3）は解除せず、押すたびに次の移動先へ送って一周する。
+     * value は画面のボタンの id（"bs2" など）でも、送る移動先の id（"bs2_a" など）でもよい。
+     * hata / hoju に切り替わったときは、対応するレーザーを1回だけ ON にする
      * （ON のまま固定はしないので、そのあと手動で OFF にできる）。
-     * OBJECT も移動先に合わせて切り替える（BS 系 -> バケツ / hatat・hatao -> 旗 / dekahoju・dekahata -> デカ雑巾）。
-     * ただし OBJECT がデカ雑巾のとき（デカ補充のあと）は hatat・hatao を選んでも旗にせずデカ雑巾のままにする。
-     * hatat と hatao は turn 調整値を別々に持つ（HATAT / HATAO）。レーザーと OBJECT の扱いは共通。
+     * OBJECT も移動先に合わせて切り替える（BS 系 -> バケツ / hata -> 旗 / dekahoju -> デカ雑巾）。
      * こちらも選んだ瞬間に1回だけなので、そのあと手動や PS ボタンで変えられる。
      */
     private fun selectMoveTarget(value: String) {
+        // 順送りのボタン。選択中なら次へ（最後の次は先頭）、そうでなければ先頭から。
+        CYCLING_MOVE_TARGETS[value]?.let { cycle ->
+            val index = cycle.indexOf(selectedTarget)
+            if (index >= 0) {
+                applyMoveTarget(cycle[(index + 1) % cycle.size])
+            } else if (canPressMoveTarget(value, selectedTarget, unlockedTargets)) {
+                applyMoveTarget(cycle.first())
+            }
+            return
+        }
         // 同じボタンをもう一度押したら解除する。選択中なのでロック判定は見るまでもない。
         if (selectedTarget == value) {
             clearMoveTarget()
             return
         }
-        // 押せない移動先はここで弾く（画面のタップも SELECT の順送りも通る道）。
+        // 押せない移動先はここで弾く。
         if (!canPressMoveTarget(value, selectedTarget, unlockedTargets)) return
+        applyMoveTarget(value)
+    }
+
+    /** 移動先を value にして、それに合わせて turn 調整の対象・レーザー・OBJECT を切り替える。 */
+    private fun applyMoveTarget(value: String) {
         selectedTarget = value
         // 選ばれていない方のレーザーは位置決めが解けたとみなして落とす。
-        if (value !in HATA_TARGETS && value != "dekahata") hataLaser = false
+        if (value != "hata") hataLaser = false
         if (value != "hoju") hojuLaser = false
         when (value) {
-            "hatat", "hatao" -> {
-                setTurnTarget(if (value == "hatat") TurnTarget.HATAT else TurnTarget.HATAO)
+            "hata" -> {
+                setTurnTarget(TurnTarget.HATA)
                 // 選んだ瞬間に1回だけ点ける。以降は固定しないので手動で消せる。
                 hataLaser = true
-                // デカ補充のあとに旗へ向かうときはデカ雑巾を撃つので、OBJECT はデカ雑巾のまま残す。
-                if (selectedObject != "dekazoukin") selectedObject = "hata"
-            }
-            // デカ雑巾を旗に撃ちに行く。turn は専用の DEKAHATA、レーザーは hata と同じで、OBJECT は必ずデカ雑巾。
-            "dekahata" -> {
-                setTurnTarget(TurnTarget.DEKAHATA)
-                hataLaser = true
-                selectedObject = "dekazoukin"
+                selectedObject = "hata"
             }
             "hoju" -> {
                 setTurnTarget(TurnTarget.HOJU)
                 hojuLaser = true
             }
             "dekahoju" -> selectedObject = "dekazoukin"
-            "bs1", "bs2", "bs3" -> {
+            in BS_TARGETS -> {
                 setTurnTarget(TurnTarget.BAKETU)
                 selectedObject = "baketu"
             }
         }
+    }
+
+    /**
+     * ロボットのログ（"Move_Target:HBO" など）で頼まれた移動先に切り替える。UI スレッドで呼ぶ。
+     * ボタンと違い、何を選んでいても自己位置がその移動先の範囲に入っているときだけ切り替える。
+     * 範囲外なら切り替えずに SYSTEM LOG に残す。
+     */
+    private fun switchMoveTargetFromLog(id: String) {
+        if (currentScreen != ScreenState.CONTROLLER || selectedTarget == id) return
+        val target = moveTargetsFor(selectedMapID).firstOrNull { it.id == id } ?: return
+        if (!isMoveTargetUnlocked(target, posX, posY, posTheta)) {
+            appendLog("MOVE TARGET ${target.label} IGNORED: out of area")
+            return
+        }
+        applyMoveTarget(id)
     }
 
     /** L3 / R3 で MOVE TARGET を解除する。位置決めをやめるのでレーザーも両方消す。 */
@@ -1089,14 +1098,13 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * SELECT ボタンで MOVE TARGET を順送りする。どの組を送るかは選択中の移動先で決まる。
-     * BS 系を選んでいれば BS1 -> BS2 -> BS3 -> BS1、HATAT / HATAO を選んでいればもう片方へ。
-     * どの組にも入っていない移動先を選んでいるとき（none 含む）は何もしない。
+     * SELECT ボタンで MOVE TARGET を順送りする。選択中の移動先が順送りのボタン（BS2 / BS3）のものなら、
+     * そのボタンを押したときと同じく次へ送る。それ以外（none 含む）のときは何もしない。
      */
     private fun cycleSelectTarget() {
-        val cycle = SELECT_TARGET_CYCLES.firstOrNull { selectedTarget in it } ?: return
-        // 組の中のどれかを選んでいる時点で何か選択中なので、ロックは掛からず必ず送れる。
-        selectMoveTarget(cycle[(cycle.indexOf(selectedTarget) + 1) % cycle.size])
+        val buttonId = CYCLING_MOVE_TARGETS.entries
+            .firstOrNull { selectedTarget in it.value }?.key ?: return
+        selectMoveTarget(buttonId)
     }
 
     /**
@@ -1118,15 +1126,10 @@ class MainActivity : ComponentActivity() {
         // con.py の保存値を受け取るまでは調整しない（受け取った時点で上書きされるため）。
         if (!settingsSynced) return
         when (selectedTurnTarget) {
-            TurnTarget.HATAT -> {
-                hatat_turnx += dx
-                hatat_turny += dy
-                hatat_turntheta += dtheta
-            }
-            TurnTarget.HATAO -> {
-                hatao_turnx += dx
-                hatao_turny += dy
-                hatao_turntheta += dtheta
+            TurnTarget.HATA -> {
+                hata_turnx += dx
+                hata_turny += dy
+                hata_turntheta += dtheta
             }
             TurnTarget.HOJU -> {
                 hoju_turnx += dx
@@ -1137,11 +1140,6 @@ class MainActivity : ComponentActivity() {
                 baketu_turnx += dx
                 baketu_turny += dy
                 baketu_turntheta += dtheta
-            }
-            TurnTarget.DEKAHATA -> {
-                dekahata_turnx += dx
-                dekahata_turny += dy
-                dekahata_turntheta += dtheta
             }
         }
     }
@@ -1226,11 +1224,9 @@ class MainActivity : ComponentActivity() {
         hataSpeed2: Float, baketuSpeed2: Float,
         hataSpeed3: Float, baketuSpeed3: Float,
         dekazoukinSpeed1: Float, dekazoukinSpeed2: Float, dekazoukinSpeed3: Float,
-        hatatTurnX: Float, hatatTurnY: Float, hatatTurnTheta: Float,
-        hataoTurnX: Float, hataoTurnY: Float, hataoTurnTheta: Float,
+        hataTurnX: Float, hataTurnY: Float, hataTurnTheta: Float,
         hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
         baketuTurnX: Float, baketuTurnY: Float, baketuTurnTheta: Float,
-        dekahataTurnX: Float, dekahataTurnY: Float, dekahataTurnTheta: Float,
         mode: String,
         selectedObject: String, selectedTarget: String,
         hataLaser: Boolean, hojuLaser: Boolean, t0: Boolean,
@@ -1241,7 +1237,7 @@ class MainActivity : ComponentActivity() {
         synced: Boolean
     ) {
         try {
-            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed1":$hataSpeed1,"baketu_speed1":$baketuSpeed1,"hata_speed2":$hataSpeed2,"baketu_speed2":$baketuSpeed2,"hata_speed3":$hataSpeed3,"baketu_speed3":$baketuSpeed3,"dekazoukin_speed1":$dekazoukinSpeed1,"dekazoukin_speed2":$dekazoukinSpeed2,"dekazoukin_speed3":$dekazoukinSpeed3,"hatat_turnx":$hatatTurnX,"hatat_turny":$hatatTurnY,"hatat_turntheta":$hatatTurnTheta,"hatao_turnx":$hataoTurnX,"hatao_turny":$hataoTurnY,"hatao_turntheta":$hataoTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"dekahata_turnx":$dekahataTurnX,"dekahata_turny":$dekahataTurnY,"dekahata_turntheta":$dekahataTurnTheta,"mode":"$mode","object":"$selectedObject","target":"$selectedTarget","hatalaser":$hataLaser,"hojulaser":$hojuLaser,"t0":$t0,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2,"start":$start,"select":$select,"ps":$ps,"synced":$synced}"""
+            val msg = """{"map_id":"$mapId","vx":$vx,"vy":$vy,"w":$w,"hata_speed1":$hataSpeed1,"baketu_speed1":$baketuSpeed1,"hata_speed2":$hataSpeed2,"baketu_speed2":$baketuSpeed2,"hata_speed3":$hataSpeed3,"baketu_speed3":$baketuSpeed3,"dekazoukin_speed1":$dekazoukinSpeed1,"dekazoukin_speed2":$dekazoukinSpeed2,"dekazoukin_speed3":$dekazoukinSpeed3,"hata_turnx":$hataTurnX,"hata_turny":$hataTurnY,"hata_turntheta":$hataTurnTheta,"hoju_turnx":$hojuTurnX,"hoju_turny":$hojuTurnY,"hoju_turntheta":$hojuTurnTheta,"baketu_turnx":$baketuTurnX,"baketu_turny":$baketuTurnY,"baketu_turntheta":$baketuTurnTheta,"mode":"$mode","object":"$selectedObject","target":"$selectedTarget","hatalaser":$hataLaser,"hojulaser":$hojuLaser,"t0":$t0,"left":$left,"right":$right,"up":$up,"down":$down,"circle":$circle,"triangle":$triangle,"square":$square,"cross":$cross,"l1":$l1,"l2":$l2,"r1":$r1,"r2":$r2,"start":$start,"select":$select,"ps":$ps,"synced":$synced}"""
             val buf = msg.toByteArray()
             val packet = DatagramPacket(buf, buf.size, address, port)
             sendTime = System.nanoTime()
@@ -1746,15 +1742,24 @@ private fun isMoveTargetUnlocked(
     return Math.abs(dTheta) <= UNLOCK_TOLERANCE_THETA
 }
 
-// 旗へ撃ちに行く移動先。turn 調整値は別々に持つが、レーザー・OBJECT の扱いは共通。
-private val HATA_TARGETS = listOf("hatat", "hatao")
+// BS2 / BS3 ボタンそれぞれで押すたびに送る移動先。並びの順に送り、最後の次は先頭に戻る。
+// send() の "target" にはボタンの id（"bs2"）ではなく、ここの id が入る。
+private val BS2_TARGETS = listOf("bs2_a", "bs2_b", "bs2_c")
+private val BS3_TARGETS = listOf("bs3_a", "bs3_b", "bs3_c")
+private val BS_TARGETS = BS2_TARGETS + BS3_TARGETS
 
-// SELECT ボタンで順送りする組。選択中の移動先が入っている組の中で、次へ送って一周する。
-// BS1 -> BS2 -> BS3 -> BS1 / HATAT <-> HATAO。
-private val SELECT_TARGET_CYCLES = listOf(
-    listOf("bs1", "bs2", "bs3"),
-    HATA_TARGETS
-)
+// ロボットのログで "Move_Target:HBO" のように送られてきたら切り替える移動先（id は小文字）。
+// 切り替えは自己位置がその移動先の範囲に入っているときだけ（switchMoveTargetFromLog）。
+private const val MOVE_TARGET_LOG_PREFIX = "Move_Target:"
+private val LOG_SWITCHABLE_TARGETS = setOf("hbo", "hbt")
+
+// 押すたびに順送りするボタン。キーがボタンの id、値が送る移動先の並び。
+// 選択中に押しても解除されない（解除は L3 / R3）。SELECT ボタンでも同じように送れる。
+private val CYCLING_MOVE_TARGETS = mapOf("bs2" to BS2_TARGETS, "bs3" to BS3_TARGETS)
+
+/** そのボタンが選択中か。順送りのボタンは、並びのどれかを選んでいれば選択中とみなす。 */
+private fun isMoveTargetButtonSelected(buttonId: String, selectedTarget: String): Boolean =
+    selectedTarget == buttonId || CYCLING_MOVE_TARGETS[buttonId]?.contains(selectedTarget) == true
 
 // 画面での並びをそのまま表す。内側の listOf 1つが 1 行分で、1 行に最大 4 つ並ぶ。
 // unlockArea の x / y（mm）・theta（度）がそのボタンを押せる場所。enabled = false でロックなし。
@@ -1763,20 +1768,25 @@ private val SELECT_TARGET_CYCLES = listOf(
 // 青ゾーン用。画面での並びもそのまま使う（各行とも 1 が右端に来るよう逆順、右詰めで表示）。
 private val BLUE_MOVE_TARGET_ROWS = listOf(
     listOf(
+        // URA / EDGE の座標は仮置き。実機のポイントが決まったら書き換えて enabled = true にする。
+        MoveTarget("ura", "URA", UnlockArea(0f, 0f, 0f, enabled = false)),
+        MoveTarget("edge", "EDGE", UnlockArea(0f, 0f, 0f, enabled = false)),
         MoveTarget("tb2", "TB2", UnlockArea(2900f, 8645f, 0f, enabled = true)),
-        MoveTarget("tb1", "TB1", UnlockArea(2900f, 2955f, 0f, enabled = true)),
-        MoveTarget("dekahata", "DEKAHATA", UnlockArea(4260f, 6000f, 0f, enabled = true))
+        MoveTarget("tb1", "TB1", UnlockArea(2900f, 2955f, 0f, enabled = true))
     ),
     listOf(
+        // HBO / HBT はロボットのログ（Move_Target:HBO / HBT）でも切り替わる。座標は仮置き。
+        MoveTarget("hbo", "HBO", UnlockArea(0f, 0f, 0f, enabled = false)),
+        MoveTarget("hbt", "HBT", UnlockArea(0f, 0f, 0f, enabled = false)),
+        // BS2 / BS3 は押すたびに _A -> _B -> _C と送る（CYCLING_MOVE_TARGETS）。
         MoveTarget("bs3", "BS3", UnlockArea(5080f, 4096f, 0f, enabled = true)),
-        MoveTarget("bs2", "BS2", UnlockArea(5080f, 3976f, 0f, enabled = true)),
-        MoveTarget("bs1", "BS1", UnlockArea(5080f, 3844f, 0f, enabled = true))
+        MoveTarget("bs2", "BS2", UnlockArea(5080f, 3976f, 0f, enabled = true))
     ),
     listOf(
-        MoveTarget("dekahoju", "DEKAHOJU", UnlockArea(3900f, 500f, -90f, enabled = true)),
+        // HATA の座標は仮置き。実機のポイントが決まったら書き換えて enabled = true にする。
+        MoveTarget("hata", "HATA", UnlockArea(0f, 0f, 0f, enabled = false)),
         MoveTarget("hoju", "HOJU", UnlockArea(4050f, 500f, 0f, enabled = true)),
-        MoveTarget("hatao", "HATAO", UnlockArea(4930f, 6700f, -12.6f, enabled = true)),
-        MoveTarget("hatat", "HATAT", UnlockArea(4930f, 5080f, 12.6f, enabled = true))
+        MoveTarget("dekahoju", "DEKAHOJU", UnlockArea(3900f, 500f, -90f, enabled = true))
     )
 )
 
@@ -1787,18 +1797,23 @@ private val RED_MOVE_TARGET_ROWS = listOf(
     listOf(
         MoveTarget("tb1", "TB1", UnlockArea(2900f, -2955f, 0f, enabled = true)),
         MoveTarget("tb2", "TB2", UnlockArea(2900f, -8645f, 0f, enabled = true)),
-        MoveTarget("dekahata", "DEKAHATA", UnlockArea(4260f, -6000f, 0f, enabled = true))
+        // URA / EDGE の座標は仮置き。実機のポイントが決まったら書き換えて enabled = true にする。
+        MoveTarget("edge", "EDGE", UnlockArea(0f, 0f, 0f, enabled = false)),
+        MoveTarget("ura", "URA", UnlockArea(0f, 0f, 0f, enabled = false))
     ),
     listOf(
-        MoveTarget("bs1", "BS1", UnlockArea(5080f, -3844f, 0f, enabled = true)),
+        // BS2 / BS3 は押すたびに _A -> _B -> _C と送る（CYCLING_MOVE_TARGETS）。
         MoveTarget("bs2", "BS2", UnlockArea(5080f, -3976f, 0f, enabled = true)),
-        MoveTarget("bs3", "BS3", UnlockArea(5080f, -4096f, 0f, enabled = true))
+        MoveTarget("bs3", "BS3", UnlockArea(5080f, -4096f, 0f, enabled = true)),
+        // HBO / HBT はロボットのログ（Move_Target:HBO / HBT）でも切り替わる。座標は仮置き。
+        MoveTarget("hbt", "HBT", UnlockArea(0f, 0f, 0f, enabled = false)),
+        MoveTarget("hbo", "HBO", UnlockArea(0f, 0f, 0f, enabled = false))
     ),
     listOf(
-        MoveTarget("hatat", "HATAT", UnlockArea(4930f, -5080f, -12.6f, enabled = true)),
-        MoveTarget("hatao", "HATAO", UnlockArea(4930f, -6700f, 12.6f, enabled = true)),
+        MoveTarget("dekahoju", "DEKAHOJU", UnlockArea(3900f, -500f, 90f, enabled = true)),
         MoveTarget("hoju", "HOJU", UnlockArea(4050f, -500f, 0f, enabled = true)),
-        MoveTarget("dekahoju", "DEKAHOJU", UnlockArea(3900f, -500f, 90f, enabled = true))
+        // HATA の座標は仮置き。実機のポイントが決まったら書き換えて enabled = true にする。
+        MoveTarget("hata", "HATA", UnlockArea(0f, 0f, 0f, enabled = false))
     )
 )
 
@@ -1829,11 +1844,9 @@ fun ControllerUI(
     currentVx: Float,
     currentVy: Float,
     currentW: Float,
-    hatatTurnX: Float, hatatTurnY: Float, hatatTurnTheta: Float,
-    hataoTurnX: Float, hataoTurnY: Float, hataoTurnTheta: Float,
+    hataTurnX: Float, hataTurnY: Float, hataTurnTheta: Float,
     hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
     baketuTurnX: Float, baketuTurnY: Float, baketuTurnTheta: Float,
-    dekahataTurnX: Float, dekahataTurnY: Float, dekahataTurnTheta: Float,
     selectedTurnTarget: TurnTarget,
     t0: Boolean,
     onToggleT0: () -> Unit,
@@ -1895,9 +1908,11 @@ fun ControllerUI(
                 moveTargetRows.forEach { rowTargets ->
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         rowTargets.forEach { target ->
+                            val selected = isMoveTargetButtonSelected(target.id, selectedTarget)
                             MoveTargetButton(
-                                label = target.label,
-                                selected = selectedTarget == target.id,
+                                // 順送りのボタンは、選択中ならいま送っている移動先（"BS2_A" など）を出す。
+                                label = if (selected && target.id in CYCLING_MOVE_TARGETS) selectedTarget.uppercase() else target.label,
+                                selected = selected,
                                 // 何も選んでいない間だけ、付近に居ないボタンをロックする。
                                 enabled = canPressMoveTarget(target.id, selectedTarget, unlockedTargets),
                                 onClick = { onSelectTarget(target.id) }
@@ -2166,7 +2181,7 @@ fun ControllerUI(
                 .width(165.dp)
                 .offset(498.dp, 174.dp),
             accent = ControllerColors.Warning,
-            // HATAT / HATAO で1行増えたぶん、下の hojustate 表示にかからないよう余白を詰めて少し上げてある。
+            // 下の hojustate 表示にかからないよう余白を詰めて少し上げてある。
             contentPadding = 4.dp
         ) {
             HudSectionTitle(
@@ -2175,10 +2190,8 @@ fun ControllerUI(
                 10.sp
             )
             Text("BAKETU X ${"%.2f".format(baketuTurnX)} Y ${"%.2f".format(baketuTurnY)} T ${"%.2f".format(baketuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
-            Text("HATAT  X ${"%.2f".format(hatatTurnX)} Y ${"%.2f".format(hatatTurnY)} T ${"%.2f".format(hatatTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
-            Text("HATAO  X ${"%.2f".format(hataoTurnX)} Y ${"%.2f".format(hataoTurnY)} T ${"%.2f".format(hataoTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
+            Text("HATA   X ${"%.2f".format(hataTurnX)} Y ${"%.2f".format(hataTurnY)} T ${"%.2f".format(hataTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
             Text("HOJU   X ${"%.2f".format(hojuTurnX)} Y ${"%.2f".format(hojuTurnY)} T ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
-            Text("DKHATA X ${"%.2f".format(dekahataTurnX)} Y ${"%.2f".format(dekahataTurnY)} T ${"%.2f".format(dekahataTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
         }
 
         // ロボットから受け取った hojustate 表示（旧 t0 ボタンの位置）
@@ -2245,16 +2258,14 @@ fun ControllerUI(
 }
 
 fun TurnTarget.displayName(): String = when (this) {
-    TurnTarget.HATAT -> "HATAT"
-    TurnTarget.HATAO -> "HATAO"
+    TurnTarget.HATA -> "HATA"
     TurnTarget.HOJU -> "HOJU"
     TurnTarget.BAKETU -> "BAKETU"
-    TurnTarget.DEKAHATA -> "DEKAHATA"
 }
 
-/** 押しっぱなしで連続調整する対象か。旗を狙う HATAT / HATAO / DEKAHATA が対象。 */
+/** 押しっぱなしで連続調整する対象か。旗を狙う HATA が対象。 */
 private fun TurnTarget.usesHoldRepeat(): Boolean =
-    this == TurnTarget.HATAT || this == TurnTarget.HATAO || this == TurnTarget.DEKAHATA
+    this == TurnTarget.HATA
 
 /** send() ?????? "object" ?????????????? */
 private fun objectDisplayName(id: String): String =
