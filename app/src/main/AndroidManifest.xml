@@ -3,6 +3,10 @@
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- requestNetwork（Wi-Fi と無線子機の併用）に必要 -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
+    <!-- ES920LR（LoRa、CH340）を USB ホストで使う。無い端末でもインストールはできるように required=false -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -24,7 +28,13 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
-
+        <!-- ES920LR を挿したとき、許可ダイアログなしでこのアプリに許可を出す（画面ピン留めと重ならないように） -->
+        <intent-filter>
+            <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+        </intent-filter>
+        <meta-data
+            android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+            android:resource="@xml/usb_device_filter" />
         </activity>
     </application>
 

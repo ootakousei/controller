@@ -19,6 +19,10 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // ES920LR（CH340）の USB シリアル用。usb-serial-for-android だけをここから取る。
+        maven("https://jitpack.io") {
+            content { includeGroup("com.github.mik3y") }
+        }
     }
 }
 
