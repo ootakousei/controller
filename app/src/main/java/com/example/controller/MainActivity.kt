@@ -26,6 +26,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -70,6 +71,7 @@ import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.roundToInt
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -84,8 +86,7 @@ enum class ScreenState {
 }
 
 enum class TurnTarget {
-    HATA_T,
-    HATA_O,
+    HATA,
     HOJU,
     BS2,
     BS3
@@ -144,10 +145,10 @@ private class SendPath(val name: String, val network: Network, val socket: Datag
     }
 }
 
-// ロボットへ送るバイナリパケット（リトルエンディアン、80 byte）。並びは send() を参照。
+// ロボットへ送るバイナリパケット（リトルエンディアン、86 byte）。並びは send() を参照。
 // con.py の decode_packet() と必ず合わせること。
-private const val PACKET_VERSION: Byte = 5
-private const val PACKET_SIZE = 80
+private const val PACKET_VERSION: Byte = 9
+private const val PACKET_SIZE = 86
 
 // float は「値 × 倍率」を四捨五入して int16 で送る（con.py の STICK_SCALE / SETTING_SCALES と合わせる）。
 // 整数で送るので、con.py 側で割り戻しても 0.30000001 のように桁が伸びない。
@@ -159,16 +160,17 @@ private const val SPEED_SCALE = 1000f       // 射出速度         : 0.001 刻�
 // turn / speed の名前と倍率。パケットの 14 バイト目からの並び（con.py の SETTING_KEYS と同じ）。
 private val SETTING_SCALES = listOf(
     "bs2_turnx" to TURN_XY_SCALE, "bs2_turny" to TURN_XY_SCALE, "bs2_turntheta" to TURN_THETA_SCALE,
-    "hatat_turnx" to TURN_XY_SCALE, "hatat_turny" to TURN_XY_SCALE, "hatat_turntheta" to TURN_THETA_SCALE,
+    "hata_hutuu_turnx" to TURN_XY_SCALE, "hata_hutuu_turny" to TURN_XY_SCALE, "hata_hutuu_turntheta" to TURN_THETA_SCALE,
     "hoju_turnx" to TURN_XY_SCALE, "hoju_turny" to TURN_XY_SCALE, "hoju_turntheta" to TURN_THETA_SCALE,
-    "hata_speed1" to SPEED_SCALE, "hata_speed2" to SPEED_SCALE, "hata_speed3" to SPEED_SCALE,
+    "hata_far_hutuu_speed1" to SPEED_SCALE, "hata_far_hutuu_speed2" to SPEED_SCALE, "hata_far_hutuu_speed3" to SPEED_SCALE,
     "baketu_speed1" to SPEED_SCALE, "baketu_speed2" to SPEED_SCALE, "baketu_speed3" to SPEED_SCALE,
     "dekazoukin_speed1" to SPEED_SCALE, "dekazoukin_speed2" to SPEED_SCALE, "dekazoukin_speed3" to SPEED_SCALE,
     "baketu_bs3_speed1" to SPEED_SCALE, "baketu_bs3_speed2" to SPEED_SCALE, "baketu_bs3_speed3" to SPEED_SCALE,
     "bs3_turnx" to TURN_XY_SCALE, "bs3_turny" to TURN_XY_SCALE, "bs3_turntheta" to TURN_THETA_SCALE,
-    "hatao_turnx" to TURN_XY_SCALE, "hatao_turny" to TURN_XY_SCALE, "hatao_turntheta" to TURN_THETA_SCALE,
-    "hatat_speed1" to SPEED_SCALE, "hatat_speed2" to SPEED_SCALE, "hatat_speed3" to SPEED_SCALE,
-    "hatao_speed1" to SPEED_SCALE, "hatao_speed2" to SPEED_SCALE, "hatao_speed3" to SPEED_SCALE,
+    "hata_deka_turnx" to TURN_XY_SCALE, "hata_deka_turny" to TURN_XY_SCALE, "hata_deka_turntheta" to TURN_THETA_SCALE,
+    "hata_near_hutuu_speed1" to SPEED_SCALE, "hata_near_hutuu_speed2" to SPEED_SCALE, "hata_near_hutuu_speed3" to SPEED_SCALE,
+    "hata_near_deka_speed1" to SPEED_SCALE, "hata_near_deka_speed2" to SPEED_SCALE, "hata_near_deka_speed3" to SPEED_SCALE,
+    "hata_far_deka_speed1" to SPEED_SCALE, "hata_far_deka_speed2" to SPEED_SCALE, "hata_far_deka_speed3" to SPEED_SCALE,
 )
 
 // 文字列の id は、この並びの番号（u8）で送る。並びにない id は 0xFF。
@@ -244,8 +246,39 @@ class MainActivity : ComponentActivity() {
             wifiAlive = { System.nanoTime() - lastPoseNanos < ES920_WIFI_TIMEOUT_MS * 1_000_000 },
             airtimeTest = ES920_AIRTIME_TEST,
             onStatus = ::applyLoraStatus,
-            onLog = ::applyLoraLog
+            onLog = ::applyLoraLog,
+            initialChannel = prefs.getInt(PREF_ES920_CHANNEL, ES920_DEFAULT_CHANNEL),
+            onScan = { results, scanningCh ->
+                runOnUiThread {
+                    loraScan = results
+                    loraScanningCh = scanningCh
+                    if (scanningCh == 0) loraScanAtMs = System.currentTimeMillis()
+                }
+            },
+            onStats = { stats -> runOnUiThread { loraStats = stats } }
         )
+    }
+
+    // フィールド選択画面の LORA CHANNEL の表示。
+    // 選んだチャンネル（保存する。モジュールの切り替えが終わるまでは es920.channel と違う）
+    private var loraSelectedCh by mutableStateOf(ES920_DEFAULT_CHANNEL)
+    // モジュールに設定してあるチャンネルと状態（LINK_REFRESH_MS ごとに写す）
+    private var loraActiveCh by mutableStateOf(ES920_DEFAULT_CHANNEL)
+    private var loraState by mutableStateOf(Es920State.NO_DEVICE)
+    // スキャンの結果と、今試しているチャンネル（0 はスキャンしていない）、終わった時刻（0 はまだ）
+    private var loraScan by mutableStateOf<List<Es920ChannelScan>>(emptyList())
+    private var loraScanningCh by mutableStateOf(0)
+    private var loraScanAtMs by mutableStateOf(0L)
+    // 最後の 5 秒ごとの統計（コントローラーの画面で送っていた間のもの）
+    private var loraStats by mutableStateOf<Es920Stats?>(null)
+
+    /** ES920LR のチャンネルを選ぶ。保存して、モジュールを切り替える（PC には今のチャンネルで知らせてから移る）。 */
+    private fun selectLoraChannel(ch: Int) {
+        if (ch !in es920.channels) return
+        loraSelectedCh = ch
+        prefs.edit().putInt(PREF_ES920_CHANNEL, ch).apply()
+        es920.requestChannel(ch)
+        appendLog("LORA CH SELECT $ch")
     }
 
     // UDP の自己位置の 13 バイト目: PC が ES920LR の行を受け取れているか（Wi-Fi が生きている間の LoRa の生死）。
@@ -289,14 +322,14 @@ class MainActivity : ComponentActivity() {
     // robot??????hojustate:xxxxxxx??????????????????
     private var hojuState by mutableStateOf("")
     // turn???
-    // 旗用の turn 調整値。MOVE TARGET の HATA_T / HATA_O それぞれで別に持つ。
-    // 分ける前は共通の hata_turn* だったので、保存値が無ければそれを引き継ぐ。
-    private var hatat_turnx by mutableStateOf(0.0f)
-    private var hatat_turny by mutableStateOf(0.0f)
-    private var hatat_turntheta by mutableStateOf(0.0f)
-    private var hatao_turnx by mutableStateOf(0.0f)
-    private var hatao_turny by mutableStateOf(0.0f)
-    private var hatao_turntheta by mutableStateOf(0.0f)
+    // 旗用の turn 調整値。HATA_T / HATA_O 共通で、× で選ぶ HUTUU 用と DEKA 用の 2 組。
+    // 保存値が無ければ、分ける前の hatat_turn*（それも無ければ hata_turn*）を引き継ぐ。
+    private var hata_hutuu_turnx by mutableStateOf(0.0f)
+    private var hata_hutuu_turny by mutableStateOf(0.0f)
+    private var hata_hutuu_turntheta by mutableStateOf(0.0f)
+    private var hata_deka_turnx by mutableStateOf(0.0f)
+    private var hata_deka_turny by mutableStateOf(0.0f)
+    private var hata_deka_turntheta by mutableStateOf(0.0f)
     private var hoju_turnx by mutableStateOf(0.0f)
     private var hoju_turny by mutableStateOf(0.0f)
     private var hoju_turntheta by mutableStateOf(0.0f)
@@ -354,7 +387,7 @@ class MainActivity : ComponentActivity() {
     private var isFlipped by mutableStateOf(true)
 
     // turn????
-    private var selectedTurnTarget by mutableStateOf(TurnTarget.HATA_T)
+    private var selectedTurnTarget by mutableStateOf(TurnTarget.HATA)
 
     // turn???1????????
     private val turnXYStep = 2f
@@ -372,19 +405,24 @@ class MainActivity : ComponentActivity() {
     private val hataTurnRepeatIntervalMs = 100L
     private var lowGain by mutableStateOf(true)
     private var baketuSpeed1 by mutableStateOf(4.5f)
-    private var hataSpeed1 by mutableStateOf(10.2f)
+    private var hataFarHutuuSpeed1 by mutableStateOf(10.2f)
     private var baketuSpeed2 by mutableStateOf(4.5f)
-    private var hataSpeed2 by mutableStateOf(10.2f)
+    private var hataFarHutuuSpeed2 by mutableStateOf(10.2f)
     private var baketuSpeed3 by mutableStateOf(4.5f)
-    private var hataSpeed3 by mutableStateOf(10.2f)
-    // 旗の速度は 3 組。移動先が HATA_T / HATA_O のときはそれぞれの組、それ以外（未選択・手動）は hataSpeed1..3。
-    // 保存値が無ければ、そのサイドの hataSpeed1..3 を引き継ぐ。
-    private var hatatSpeed1 by mutableStateOf(10.2f)
-    private var hatatSpeed2 by mutableStateOf(10.2f)
-    private var hatatSpeed3 by mutableStateOf(10.2f)
-    private var hataoSpeed1 by mutableStateOf(10.2f)
-    private var hataoSpeed2 by mutableStateOf(10.2f)
-    private var hataoSpeed3 by mutableStateOf(10.2f)
+    private var hataFarHutuuSpeed3 by mutableStateOf(10.2f)
+    // 旗の速度は NEAR（移動先が HATA_T / HATA_O。2 つ共通）と FAR（それ以外。未選択・手動）の 2 か所で、
+    // それぞれ × で選ぶ HUTUU / DEKA の 2 組。hataFarHutuuSpeed1..3 は上（バケツと並んでいるもの）。
+    // FAR の保存値が無ければ、元の旗の速度 hata_speed* を引き継ぐ。
+    private var hataFarDekaSpeed1 by mutableStateOf(10.2f)
+    private var hataFarDekaSpeed2 by mutableStateOf(10.2f)
+    private var hataFarDekaSpeed3 by mutableStateOf(10.2f)
+    // NEAR の保存値が無ければ、分ける前の hatat_speed*（それも無ければ元の旗の速度 hata_speed*）を引き継ぐ。
+    private var hataNearHutuuSpeed1 by mutableStateOf(10.2f)
+    private var hataNearHutuuSpeed2 by mutableStateOf(10.2f)
+    private var hataNearHutuuSpeed3 by mutableStateOf(10.2f)
+    private var hataNearDekaSpeed1 by mutableStateOf(10.2f)
+    private var hataNearDekaSpeed2 by mutableStateOf(10.2f)
+    private var hataNearDekaSpeed3 by mutableStateOf(10.2f)
 
     // デカ雑巾の射出速度。初期値・可変範囲は下の DEKAZOUKIN_SPEED_* で定義する。
     // BS3 用のバケツの射出速度。baketuSpeed1..3 が BS2 用。
@@ -398,8 +436,17 @@ class MainActivity : ComponentActivity() {
     private var baketuBs3 by mutableStateOf(false)
 
     // 最後に MOVE TARGET で選んだ旗の移動先が HATA_O なら true（起動直後は HATA_T）。
-    // ロボットが旗の地点で使う turn 調整値（con.py が hata_turn_* に振り替える）がこれで決まる。
+    // 旗の turn・速度は HATA_T / HATA_O 共通にしたので、今は con.py へ送るだけ（ロボットでは使っていない）。
     private var hataO by mutableStateOf(false)
+
+    // × ボタンで切り替える旗の turn・速度の組。true なら DEKA 用（起動直後は HUTUU）。
+    // 旗の TURN / SPEED ADJUST の表示・調整対象と、ロボットが使う turn・速度（mast2 の drive2 / input が選ぶ）がこれで決まる。
+    private var hataDeka by mutableStateOf(false)
+
+    // MOVE TARGET で DEKAHOJU を選んでから、デカ雑巾を撃つ（□ / ○）までは true。
+    // その間は、どの移動先を選んでも OBJECT をデカ雑巾から変えない（applyMoveTarget）。
+    // PS ボタン・画面の OBJECT で手で変えたときも解ける。
+    private var dekazoukinLocked = false
 
     private var dekazoukinSpeed1 by mutableStateOf(DEKAZOUKIN_SPEED_DEFAULT)
     private var dekazoukinSpeed2 by mutableStateOf(DEKAZOUKIN_SPEED_DEFAULT)
@@ -736,7 +783,8 @@ class MainActivity : ComponentActivity() {
                     return true
                 }
                 KeyEvent.KEYCODE_BUTTON_START -> { start = true; return true }
-                // SELECT ボタンで、BS 系を選んでいれば BS ボタンを押したときと同じく次へ送る
+                // SELECT ボタンで、BS 系を選んでいれば BS ボタンを押したときと同じく次へ送る。
+                // HATA_T / HATA_O を選んでいれば、もう一方に切り替える。
                 KeyEvent.KEYCODE_BUTTON_SELECT -> {
                     select = true
                     if (event.repeatCount == 0) {
@@ -752,9 +800,25 @@ class MainActivity : ComponentActivity() {
                     }
                     return true
                 }
-                KeyEvent.KEYCODE_BUTTON_A -> { cross = true; return true }
-                KeyEvent.KEYCODE_BUTTON_B -> { circle = true; return true }
-                KeyEvent.KEYCODE_BUTTON_X -> { square = true; return true }
+                // × で旗の turn・速度の組（HATA_T / HATA_O 共通）を HUTUU <-> DEKA と切り替える。× はロボットにも今まで通り送る。
+                KeyEvent.KEYCODE_BUTTON_A -> {
+                    cross = true
+                    if (event.repeatCount == 0) {
+                        toggleHataDeka()
+                    }
+                    return true
+                }
+                // ○ / □ はデカ雑巾を撃つボタン（△ はデカ雑巾では撃たない）。押したらデカ雑巾の固定を解く。
+                KeyEvent.KEYCODE_BUTTON_B -> {
+                    circle = true
+                    if (event.repeatCount == 0) releaseDekazoukinLock()
+                    return true
+                }
+                KeyEvent.KEYCODE_BUTTON_X -> {
+                    square = true
+                    if (event.repeatCount == 0) releaseDekazoukinLock()
+                    return true
+                }
                 KeyEvent.KEYCODE_BUTTON_Y -> { triangle = true; return true }
                 KeyEvent.KEYCODE_BUTTON_L1 -> { l1 = true; return true }
                 KeyEvent.KEYCODE_BUTTON_R1 -> { r1 = true; return true }
@@ -816,13 +880,16 @@ class MainActivity : ComponentActivity() {
         if (mapId != loadedSettingsMapID || settingsSynced) return
         fun f(name: String, current: Float): Float =
             settings.optDouble(name, current.toDouble()).toFloat()
-        // hatat / hatao_turn* がまだ無い（共通の hata_turn* だった頃の）設定値なら、hata_turn* を引き継ぐ。
-        hatat_turnx = f("hatat_turnx", f("hata_turnx", hatat_turnx))
-        hatat_turny = f("hatat_turny", f("hata_turny", hatat_turny))
-        hatat_turntheta = f("hatat_turntheta", f("hata_turntheta", hatat_turntheta))
-        hatao_turnx = f("hatao_turnx", f("hata_turnx", hatao_turnx))
-        hatao_turny = f("hatao_turny", f("hata_turny", hatao_turny))
-        hatao_turntheta = f("hatao_turntheta", f("hata_turntheta", hatao_turntheta))
+        // HUTUU / DEKA の turn がまだ無い（分ける前の）設定値なら、hatat_turn*（それも無ければ hata_turn*）を引き継ぐ。
+        val hataTurnX = f("hatat_turnx", f("hata_turnx", hata_hutuu_turnx))
+        val hataTurnY = f("hatat_turny", f("hata_turny", hata_hutuu_turny))
+        val hataTurnTheta = f("hatat_turntheta", f("hata_turntheta", hata_hutuu_turntheta))
+        hata_hutuu_turnx = f("hata_hutuu_turnx", hataTurnX)
+        hata_hutuu_turny = f("hata_hutuu_turny", hataTurnY)
+        hata_hutuu_turntheta = f("hata_hutuu_turntheta", hataTurnTheta)
+        hata_deka_turnx = f("hata_deka_turnx", hataTurnX)
+        hata_deka_turny = f("hata_deka_turny", hataTurnY)
+        hata_deka_turntheta = f("hata_deka_turntheta", hataTurnTheta)
         hoju_turnx = f("hoju_turnx", hoju_turnx)
         hoju_turny = f("hoju_turny", hoju_turny)
         hoju_turntheta = f("hoju_turntheta", hoju_turntheta)
@@ -833,16 +900,26 @@ class MainActivity : ComponentActivity() {
         bs3_turnx = f("bs3_turnx", f("baketu_turnx", bs3_turnx))
         bs3_turny = f("bs3_turny", f("baketu_turny", bs3_turny))
         bs3_turntheta = f("bs3_turntheta", f("baketu_turntheta", bs3_turntheta))
-        hataSpeed1 = f("hata_speed1", hataSpeed1)
-        hataSpeed2 = f("hata_speed2", hataSpeed2)
-        hataSpeed3 = f("hata_speed3", hataSpeed3)
-        // HATA_T / HATA_O の値が無い（分ける前の）設定値なら、旗の値を引き継ぐ。
-        hatatSpeed1 = f("hatat_speed1", hataSpeed1)
-        hatatSpeed2 = f("hatat_speed2", hataSpeed2)
-        hatatSpeed3 = f("hatat_speed3", hataSpeed3)
-        hataoSpeed1 = f("hatao_speed1", hataSpeed1)
-        hataoSpeed2 = f("hatao_speed2", hataSpeed2)
-        hataoSpeed3 = f("hatao_speed3", hataSpeed3)
+        // FAR / NEAR の値が無い（分ける前の）設定値なら、FAR は元の旗の速度 hata_speed*、
+        // NEAR は HATA_T 用だった hatat_speed*（それも無ければ hata_speed*）を引き継ぐ。
+        val hataSpeed1 = f("hata_speed1", hataFarHutuuSpeed1)
+        val hataSpeed2 = f("hata_speed2", hataFarHutuuSpeed2)
+        val hataSpeed3 = f("hata_speed3", hataFarHutuuSpeed3)
+        val hatatSpeed1 = f("hatat_speed1", hataSpeed1)
+        val hatatSpeed2 = f("hatat_speed2", hataSpeed2)
+        val hatatSpeed3 = f("hatat_speed3", hataSpeed3)
+        hataFarHutuuSpeed1 = f("hata_far_hutuu_speed1", hataSpeed1)
+        hataFarHutuuSpeed2 = f("hata_far_hutuu_speed2", hataSpeed2)
+        hataFarHutuuSpeed3 = f("hata_far_hutuu_speed3", hataSpeed3)
+        hataFarDekaSpeed1 = f("hata_far_deka_speed1", hataSpeed1)
+        hataFarDekaSpeed2 = f("hata_far_deka_speed2", hataSpeed2)
+        hataFarDekaSpeed3 = f("hata_far_deka_speed3", hataSpeed3)
+        hataNearHutuuSpeed1 = f("hata_near_hutuu_speed1", hatatSpeed1)
+        hataNearHutuuSpeed2 = f("hata_near_hutuu_speed2", hatatSpeed2)
+        hataNearHutuuSpeed3 = f("hata_near_hutuu_speed3", hatatSpeed3)
+        hataNearDekaSpeed1 = f("hata_near_deka_speed1", hatatSpeed1)
+        hataNearDekaSpeed2 = f("hata_near_deka_speed2", hatatSpeed2)
+        hataNearDekaSpeed3 = f("hata_near_deka_speed3", hatatSpeed3)
         baketuSpeed1 = f("baketu_speed1", baketuSpeed1)
         baketuSpeed2 = f("baketu_speed2", baketuSpeed2)
         baketuSpeed3 = f("baketu_speed3", baketuSpeed3)
@@ -861,7 +938,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * LoRa で届いた con.py の設定値（66 バイト、送るパケットの 14〜79 バイトと同じ並び・倍率）を反映する。
+     * LoRa で届いた con.py の設定値（72 バイト、送るパケットの 14〜85 バイトと同じ並び・倍率）を反映する。
      * Wi-Fi が無く、ログ用ポート 5006 の "settings" が届かないときの SYNC 用。
      */
     private fun applyLoraSettings(mapIndex: Int, data: ByteArray) {
@@ -912,6 +989,8 @@ class MainActivity : ComponentActivity() {
         val wifi = lastPoseNanos != 0L && System.nanoTime() - lastPoseNanos < LINK_WIFI_TIMEOUT_MS * 1_000_000
         linkWifiOk = wifi
         val now = System.currentTimeMillis()
+        loraState = es920.state
+        loraActiveCh = es920.channel
         when (es920.state) {
             Es920State.NO_DEVICE -> {
                 linkLoraText = "LORA NO USB"
@@ -942,16 +1021,17 @@ class MainActivity : ComponentActivity() {
 
     /** 選んだサイドの turn 調整値と射出速度を読み込む。 */
     private fun loadSettings(mapId: String) {
-        // hatat / hatao_turn* の保存値が無ければ、共通だった頃の hata_turn* を引き継ぐ（hata は saveSettings で消す）。
-        val hataTurnX = loadSideFloat(mapId, "hata_turnx", 0.0f)
-        val hataTurnY = loadSideFloat(mapId, "hata_turny", 0.0f)
-        val hataTurnTheta = loadSideFloat(mapId, "hata_turntheta", 0.0f)
-        hatat_turnx = loadSideFloat(mapId, "hatat_turnx", hataTurnX)
-        hatat_turny = loadSideFloat(mapId, "hatat_turny", hataTurnY)
-        hatat_turntheta = loadSideFloat(mapId, "hatat_turntheta", hataTurnTheta)
-        hatao_turnx = loadSideFloat(mapId, "hatao_turnx", hataTurnX)
-        hatao_turny = loadSideFloat(mapId, "hatao_turny", hataTurnY)
-        hatao_turntheta = loadSideFloat(mapId, "hatao_turntheta", hataTurnTheta)
+        // HUTUU / DEKA の turn の保存値が無ければ、分ける前の hatat_turn* を引き継ぐ。
+        // それも無ければ、共通だった頃の hata_turn* を引き継ぐ（どちらも saveSettings で消す）。
+        val hataTurnX = loadSideFloat(mapId, "hatat_turnx", loadSideFloat(mapId, "hata_turnx", 0.0f))
+        val hataTurnY = loadSideFloat(mapId, "hatat_turny", loadSideFloat(mapId, "hata_turny", 0.0f))
+        val hataTurnTheta = loadSideFloat(mapId, "hatat_turntheta", loadSideFloat(mapId, "hata_turntheta", 0.0f))
+        hata_hutuu_turnx = loadSideFloat(mapId, "hata_hutuu_turnx", hataTurnX)
+        hata_hutuu_turny = loadSideFloat(mapId, "hata_hutuu_turny", hataTurnY)
+        hata_hutuu_turntheta = loadSideFloat(mapId, "hata_hutuu_turntheta", hataTurnTheta)
+        hata_deka_turnx = loadSideFloat(mapId, "hata_deka_turnx", hataTurnX)
+        hata_deka_turny = loadSideFloat(mapId, "hata_deka_turny", hataTurnY)
+        hata_deka_turntheta = loadSideFloat(mapId, "hata_deka_turntheta", hataTurnTheta)
         hoju_turnx = loadSideFloat(mapId, "hoju_turnx", 0.0f)
         hoju_turny = loadSideFloat(mapId, "hoju_turny", 0.0f)
         hoju_turntheta = loadSideFloat(mapId, "hoju_turntheta", 0.0f)
@@ -965,16 +1045,26 @@ class MainActivity : ComponentActivity() {
         bs3_turnx = loadSideFloat(mapId, "bs3_turnx", baketuTurnX)
         bs3_turny = loadSideFloat(mapId, "bs3_turny", baketuTurnY)
         bs3_turntheta = loadSideFloat(mapId, "bs3_turntheta", baketuTurnTheta)
-        hataSpeed1 = loadSideFloat(mapId, "hata_speed1", 10.2f)
-        hataSpeed2 = loadSideFloat(mapId, "hata_speed2", 10.2f)
-        hataSpeed3 = loadSideFloat(mapId, "hata_speed3", 10.2f)
-        // HATA_T / HATA_O の保存値が無ければ、そのサイドの旗の値を引き継ぐ。
-        hatatSpeed1 = loadSideFloat(mapId, "hatat_speed1", hataSpeed1)
-        hatatSpeed2 = loadSideFloat(mapId, "hatat_speed2", hataSpeed2)
-        hatatSpeed3 = loadSideFloat(mapId, "hatat_speed3", hataSpeed3)
-        hataoSpeed1 = loadSideFloat(mapId, "hatao_speed1", hataSpeed1)
-        hataoSpeed2 = loadSideFloat(mapId, "hatao_speed2", hataSpeed2)
-        hataoSpeed3 = loadSideFloat(mapId, "hatao_speed3", hataSpeed3)
+        // FAR / NEAR の保存値が無ければ、FAR は元の旗の速度 hata_speed*、NEAR は HATA_T 用だった hatat_speed*
+        // （それも無ければ hata_speed*）を引き継ぐ（hata / hatat / hatao_speed* は saveSettings で消す）。
+        val hataSpeed1 = loadSideFloat(mapId, "hata_speed1", 10.2f)
+        val hataSpeed2 = loadSideFloat(mapId, "hata_speed2", 10.2f)
+        val hataSpeed3 = loadSideFloat(mapId, "hata_speed3", 10.2f)
+        val hatatSpeed1 = loadSideFloat(mapId, "hatat_speed1", hataSpeed1)
+        val hatatSpeed2 = loadSideFloat(mapId, "hatat_speed2", hataSpeed2)
+        val hatatSpeed3 = loadSideFloat(mapId, "hatat_speed3", hataSpeed3)
+        hataFarHutuuSpeed1 = loadSideFloat(mapId, "hata_far_hutuu_speed1", hataSpeed1)
+        hataFarHutuuSpeed2 = loadSideFloat(mapId, "hata_far_hutuu_speed2", hataSpeed2)
+        hataFarHutuuSpeed3 = loadSideFloat(mapId, "hata_far_hutuu_speed3", hataSpeed3)
+        hataFarDekaSpeed1 = loadSideFloat(mapId, "hata_far_deka_speed1", hataSpeed1)
+        hataFarDekaSpeed2 = loadSideFloat(mapId, "hata_far_deka_speed2", hataSpeed2)
+        hataFarDekaSpeed3 = loadSideFloat(mapId, "hata_far_deka_speed3", hataSpeed3)
+        hataNearHutuuSpeed1 = loadSideFloat(mapId, "hata_near_hutuu_speed1", hatatSpeed1)
+        hataNearHutuuSpeed2 = loadSideFloat(mapId, "hata_near_hutuu_speed2", hatatSpeed2)
+        hataNearHutuuSpeed3 = loadSideFloat(mapId, "hata_near_hutuu_speed3", hatatSpeed3)
+        hataNearDekaSpeed1 = loadSideFloat(mapId, "hata_near_deka_speed1", hatatSpeed1)
+        hataNearDekaSpeed2 = loadSideFloat(mapId, "hata_near_deka_speed2", hatatSpeed2)
+        hataNearDekaSpeed3 = loadSideFloat(mapId, "hata_near_deka_speed3", hatatSpeed3)
         baketuSpeed1 = loadSideFloat(mapId, "baketu_speed1", 4.5f)
         baketuSpeed2 = loadSideFloat(mapId, "baketu_speed2", 4.5f)
         baketuSpeed3 = loadSideFloat(mapId, "baketu_speed3", 4.5f)
@@ -997,13 +1087,19 @@ class MainActivity : ComponentActivity() {
     private fun saveSettings() {
         val mapId = loadedSettingsMapID ?: return
         prefs.edit()
-            .putFloat("${mapId}_hatat_turnx", hatat_turnx)
-            .putFloat("${mapId}_hatat_turny", hatat_turny)
-            .putFloat("${mapId}_hatat_turntheta", hatat_turntheta)
-            .putFloat("${mapId}_hatao_turnx", hatao_turnx)
-            .putFloat("${mapId}_hatao_turny", hatao_turny)
-            .putFloat("${mapId}_hatao_turntheta", hatao_turntheta)
-            // hatat / hatao に引き継ぎ済みなので、共通だった頃の hata_turn* は消す。
+            .putFloat("${mapId}_hata_hutuu_turnx", hata_hutuu_turnx)
+            .putFloat("${mapId}_hata_hutuu_turny", hata_hutuu_turny)
+            .putFloat("${mapId}_hata_hutuu_turntheta", hata_hutuu_turntheta)
+            .putFloat("${mapId}_hata_deka_turnx", hata_deka_turnx)
+            .putFloat("${mapId}_hata_deka_turny", hata_deka_turny)
+            .putFloat("${mapId}_hata_deka_turntheta", hata_deka_turntheta)
+            // HUTUU / DEKA に引き継ぎ済みなので、分ける前の hatat / hatao_turn* と、共通だった頃の hata_turn* は消す。
+            .remove("${mapId}_hatat_turnx")
+            .remove("${mapId}_hatat_turny")
+            .remove("${mapId}_hatat_turntheta")
+            .remove("${mapId}_hatao_turnx")
+            .remove("${mapId}_hatao_turny")
+            .remove("${mapId}_hatao_turntheta")
             .remove("${mapId}_hata_turnx")
             .remove("${mapId}_hata_turny")
             .remove("${mapId}_hata_turntheta")
@@ -1024,15 +1120,28 @@ class MainActivity : ComponentActivity() {
             .remove("${mapId}_baketu_turnx")
             .remove("${mapId}_baketu_turny")
             .remove("${mapId}_baketu_turntheta")
-            .putFloat("${mapId}_hata_speed1", hataSpeed1)
-            .putFloat("${mapId}_hata_speed2", hataSpeed2)
-            .putFloat("${mapId}_hata_speed3", hataSpeed3)
-            .putFloat("${mapId}_hatat_speed1", hatatSpeed1)
-            .putFloat("${mapId}_hatat_speed2", hatatSpeed2)
-            .putFloat("${mapId}_hatat_speed3", hatatSpeed3)
-            .putFloat("${mapId}_hatao_speed1", hataoSpeed1)
-            .putFloat("${mapId}_hatao_speed2", hataoSpeed2)
-            .putFloat("${mapId}_hatao_speed3", hataoSpeed3)
+            .putFloat("${mapId}_hata_far_hutuu_speed1", hataFarHutuuSpeed1)
+            .putFloat("${mapId}_hata_far_hutuu_speed2", hataFarHutuuSpeed2)
+            .putFloat("${mapId}_hata_far_hutuu_speed3", hataFarHutuuSpeed3)
+            .putFloat("${mapId}_hata_far_deka_speed1", hataFarDekaSpeed1)
+            .putFloat("${mapId}_hata_far_deka_speed2", hataFarDekaSpeed2)
+            .putFloat("${mapId}_hata_far_deka_speed3", hataFarDekaSpeed3)
+            .putFloat("${mapId}_hata_near_hutuu_speed1", hataNearHutuuSpeed1)
+            .putFloat("${mapId}_hata_near_hutuu_speed2", hataNearHutuuSpeed2)
+            .putFloat("${mapId}_hata_near_hutuu_speed3", hataNearHutuuSpeed3)
+            .putFloat("${mapId}_hata_near_deka_speed1", hataNearDekaSpeed1)
+            .putFloat("${mapId}_hata_near_deka_speed2", hataNearDekaSpeed2)
+            .putFloat("${mapId}_hata_near_deka_speed3", hataNearDekaSpeed3)
+            // FAR / NEAR に引き継ぎ済みなので、分ける前の hata / hatat / hatao_speed* は消す。
+            .remove("${mapId}_hata_speed1")
+            .remove("${mapId}_hata_speed2")
+            .remove("${mapId}_hata_speed3")
+            .remove("${mapId}_hatat_speed1")
+            .remove("${mapId}_hatat_speed2")
+            .remove("${mapId}_hatat_speed3")
+            .remove("${mapId}_hatao_speed1")
+            .remove("${mapId}_hatao_speed2")
+            .remove("${mapId}_hatao_speed3")
             .putFloat("${mapId}_baketu_speed1", baketuSpeed1)
             .putFloat("${mapId}_baketu_speed2", baketuSpeed2)
             .putFloat("${mapId}_baketu_speed3", baketuSpeed3)
@@ -1061,6 +1170,8 @@ class MainActivity : ComponentActivity() {
         registerSendPaths()
         // ES920LR（LoRa）。挿さっていなければ 1 秒ごとに探し続ける。
         es920.start(lifecycleScope)
+        loraSelectedCh = es920.channel
+        loraActiveCh = es920.channel
 
         // --- ???? ---
         // ???????????????????????????????????
@@ -1113,7 +1224,23 @@ class MainActivity : ComponentActivity() {
                         isFlipped = isFlipped,
                         networkWarning = otherNetworkUp,
                         onToggleFlip = { isFlipped = !isFlipped },
+                        lora = LoraChannelUi(
+                            profileName = es920.profileName,
+                            channels = es920.channels,
+                            freqMhz = es920::freqMhz,
+                            selected = loraSelectedCh,
+                            active = loraActiveCh,
+                            state = loraState,
+                            scan = loraScan,
+                            scanningCh = loraScanningCh,
+                            scanAtMs = loraScanAtMs,
+                            stats = loraStats
+                        ),
+                        onScanLora = { es920.requestScan() },
+                        onSelectLoraChannel = ::selectLoraChannel,
                         onSelectTeam = { mapStr ->
+                            // スキャン中ならやめる（操作を送れるように）
+                            es920.cancelScan()
                             selectedMapID = mapStr
                             loadSettings(mapStr)
                             currentScreen = ScreenState.CONTROLLER
@@ -1135,8 +1262,8 @@ class MainActivity : ComponentActivity() {
                         currentVx = if (lowGain) vy / 2f else vy,
                         currentVy = if (lowGain) vx / 2f else vx,
                         currentW = if (lowGain) w / 2f else w,
-                        hataTTurnX = hatat_turnx, hataTTurnY = hatat_turny, hataTTurnTheta = hatat_turntheta,
-                        hataOTurnX = hatao_turnx, hataOTurnY = hatao_turny, hataOTurnTheta = hatao_turntheta,
+                        hataHutuuTurnX = hata_hutuu_turnx, hataHutuuTurnY = hata_hutuu_turny, hataHutuuTurnTheta = hata_hutuu_turntheta,
+                        hataDekaTurnX = hata_deka_turnx, hataDekaTurnY = hata_deka_turny, hataDekaTurnTheta = hata_deka_turntheta,
                         hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
                         bs2TurnX = bs2_turnx, bs2TurnY = bs2_turny, bs2TurnTheta = bs2_turntheta,
                         bs3TurnX = bs3_turnx, bs3TurnY = bs3_turny, bs3TurnTheta = bs3_turntheta,
@@ -1150,6 +1277,7 @@ class MainActivity : ComponentActivity() {
                         onSelectObject = { value ->
                             // ?3?????????????1?????????????????????
                             selectedObject = value
+                            releaseDekazoukinLock()
                         },
                         selectedTarget = selectedTarget,
                         onSelectTarget = { value -> selectMoveTarget(value) },
@@ -1171,6 +1299,7 @@ class MainActivity : ComponentActivity() {
                         t0locked = t0Locked,
                         settingsSynced = settingsSynced,
                         baketuBs3 = baketuBs3,
+                        hataDeka = hataDeka,
                         linkWifiOk = linkWifiOk,
                         linkLoraText = linkLoraText,
                         linkLoraOk = linkLoraOk
@@ -1313,15 +1442,16 @@ class MainActivity : ComponentActivity() {
                     if (lowGain) vy / 2f else vy,
                     if (lowGain) vx / 2f else vx,
                     if (lowGain) w / 2f else w,
-                    hataSpeed1, baketuSpeed1,
-                    hataSpeed2, baketuSpeed2,
-                    hataSpeed3, baketuSpeed3,
+                    hataFarHutuuSpeed1, baketuSpeed1,
+                    hataFarHutuuSpeed2, baketuSpeed2,
+                    hataFarHutuuSpeed3, baketuSpeed3,
                     dekazoukinSpeed1, dekazoukinSpeed2, dekazoukinSpeed3,
                     baketuBs3Speed1, baketuBs3Speed2, baketuBs3Speed3, baketuBs3,
-                    hatat_turnx, hatat_turny, hatat_turntheta,
-                    hatao_turnx, hatao_turny, hatao_turntheta, hataO,
-                    hatatSpeed1, hatatSpeed2, hatatSpeed3,
-                    hataoSpeed1, hataoSpeed2, hataoSpeed3,
+                    hata_hutuu_turnx, hata_hutuu_turny, hata_hutuu_turntheta,
+                    hata_deka_turnx, hata_deka_turny, hata_deka_turntheta, hataO,
+                    hataNearHutuuSpeed1, hataNearHutuuSpeed2, hataNearHutuuSpeed3,
+                    hataNearDekaSpeed1, hataNearDekaSpeed2, hataNearDekaSpeed3,
+                    hataFarDekaSpeed1, hataFarDekaSpeed2, hataFarDekaSpeed3, hataDeka,
                     hoju_turnx, hoju_turny, hoju_turntheta,
                     bs2_turnx, bs2_turny, bs2_turntheta,
                     bs3_turnx, bs3_turny, bs3_turntheta,
@@ -1450,8 +1580,8 @@ class MainActivity : ComponentActivity() {
      * hata_t・hata_o / hoju に切り替わったときは、対応するレーザーを1回だけ ON にする
      * （ON のまま固定はしないので、そのあと手動で OFF にできる）。
      * OBJECT も移動先に合わせて切り替える（BS 系 -> バケツ / hata_t・hata_o -> 旗 / dekahoju -> デカ雑巾）。
-     * ただし OBJECT がデカ雑巾のとき（デカ補充のあと）は hata_t・hata_o を選んでも旗にせずデカ雑巾のままにする。
-     * hata_t と hata_o は turn 調整値を別々に持つ（HATA_T / HATA_O）。レーザーと OBJECT の扱いは共通。
+     * ただし DEKAHOJU を選んでからデカ雑巾を撃つ（□ / ○）までは、どの移動先を選んでも OBJECT をデカ雑巾のままにする（dekazoukinLocked）。
+     * hata_t と hata_o は turn 調整値・速度・レーザー・OBJECT の扱いが共通（turn・速度は × で HUTUU / DEKA を選ぶ）。
      * こちらも選んだ瞬間に1回だけなので、そのあと手動や PS ボタンで変えられる。
      */
     private fun selectMoveTarget(value: String) {
@@ -1483,22 +1613,26 @@ class MainActivity : ComponentActivity() {
         if (value != "hoju") hojuLaser = false
         when (value) {
             in HATA_TARGETS -> {
-                // ロボットが旗の地点で使う turn は、最後に選んだ方のもの（解除しても戻さない）。
                 hataO = value == "hata_o"
-                setTurnTarget(if (hataO) TurnTarget.HATA_O else TurnTarget.HATA_T)
+                setTurnTarget(TurnTarget.HATA)
                 // 選んだ瞬間に1回だけ点ける。以降は固定しないので手動で消せる。
                 hataLaser = true
-                // デカ補充のあとに旗へ向かうときはデカ雑巾を撃つので、OBJECT はデカ雑巾のまま残す。
-                if (selectedObject != "dekazoukin") selectedObject = "hata"
+                // デカ補充のあと（撃つまで）はデカ雑巾を撃つので、OBJECT はデカ雑巾のまま残す。
+                if (!dekazoukinLocked) selectedObject = "hata"
             }
             "hoju" -> {
                 setTurnTarget(TurnTarget.HOJU)
                 hojuLaser = true
             }
-            "dekahoju" -> selectedObject = "dekazoukin"
+            "dekahoju" -> {
+                selectedObject = "dekazoukin"
+                if (!dekazoukinLocked) appendLog("OBJECT: DEKAZOUKIN LOCKED")
+                dekazoukinLocked = true
+            }
             in BS_TARGETS -> {
                 setTurnTarget(if (value in BS3_TARGETS) TurnTarget.BS3 else TurnTarget.BS2)
-                selectedObject = "baketu"
+                // デカ補充のあと（撃つまで）は OBJECT をデカ雑巾のまま残す。
+                if (!dekazoukinLocked) selectedObject = "baketu"
                 // バケツの射出速度は、最後に選んだ BS のものを使う（解除しても戻さない）。
                 baketuBs3 = value in BS3_TARGETS
             }
@@ -1535,9 +1669,15 @@ class MainActivity : ComponentActivity() {
 
     /**
      * SELECT ボタンで MOVE TARGET を順送りする。選択中の移動先が順送りのボタン（BS2 / BS3）のものなら、
-     * そのボタンを押したときと同じく次へ送る。それ以外（none 含む）のときは何もしない。
+     * そのボタンを押したときと同じく次へ送る。HATA_T / HATA_O ならもう一方に切り替える。
+     * それ以外（none 含む）のときは何もしない。
      */
     private fun cycleSelectTarget() {
+        // HATA_T / HATA_O を選んでいれば、もう一方に切り替える（画面で押したときと同じ扱い）。
+        if (selectedTarget in HATA_TARGETS) {
+            selectMoveTarget(HATA_TARGETS.first { it != selectedTarget })
+            return
+        }
         val buttonId = CYCLING_MOVE_TARGETS.entries
             .firstOrNull { selectedTarget in it.value }?.key ?: return
         selectMoveTarget(buttonId)
@@ -1552,6 +1692,14 @@ class MainActivity : ComponentActivity() {
         if (ids.isEmpty()) return
         val nextIndex = (ids.indexOf(selectedObject) + 1) % ids.size
         selectedObject = ids[nextIndex]
+        releaseDekazoukinLock()
+    }
+
+    /** デカ雑巾の固定（dekazoukinLocked）を解く。撃ったときと、OBJECT を手で変えたときに呼ぶ。 */
+    private fun releaseDekazoukinLock() {
+        if (!dekazoukinLocked) return
+        dekazoukinLocked = false
+        appendLog("OBJECT: DEKAZOUKIN UNLOCKED")
     }
 
     private fun adjustSelectedTurn(
@@ -1565,15 +1713,15 @@ class MainActivity : ComponentActivity() {
         fun xy(v: Float, d: Float) = (v + d).roundToScale(TURN_XY_SCALE)
         fun theta(v: Float, d: Float) = (v + d).roundToScale(TURN_THETA_SCALE)
         when (selectedTurnTarget) {
-            TurnTarget.HATA_T -> {
-                hatat_turnx = xy(hatat_turnx, dx)
-                hatat_turny = xy(hatat_turny, dy)
-                hatat_turntheta = theta(hatat_turntheta, dtheta)
-            }
-            TurnTarget.HATA_O -> {
-                hatao_turnx = xy(hatao_turnx, dx)
-                hatao_turny = xy(hatao_turny, dy)
-                hatao_turntheta = theta(hatao_turntheta, dtheta)
+            // 旗は × で選んでいる方（HUTUU / DEKA）を動かす。
+            TurnTarget.HATA -> if (hataDeka) {
+                hata_deka_turnx = xy(hata_deka_turnx, dx)
+                hata_deka_turny = xy(hata_deka_turny, dy)
+                hata_deka_turntheta = theta(hata_deka_turntheta, dtheta)
+            } else {
+                hata_hutuu_turnx = xy(hata_hutuu_turnx, dx)
+                hata_hutuu_turny = xy(hata_hutuu_turny, dy)
+                hata_hutuu_turntheta = theta(hata_hutuu_turntheta, dtheta)
             }
             TurnTarget.HOJU -> {
                 hoju_turnx = xy(hoju_turnx, dx)
@@ -1598,22 +1746,34 @@ class MainActivity : ComponentActivity() {
      * SPEED ADJUST はこの値を表示するので、OBJECT を切り替えると調整対象も切り替わる。
      */
     private fun selectedObjectSpeed(column: Int): Float = when (selectedObject) {
-        // 旗は今の移動先（HATA_T / HATA_O / それ以外）の組を出す。con.py も同じ選び方でロボットへ渡す。
+        // 旗は、移動先が HATA_T / HATA_O なら NEAR、それ以外なら FAR の、× で選んだ HUTUU / DEKA の組を出す。
+        // ロボットでは mast2 の input.cpp が同じ選び方をする。
         "hata" -> when (selectedTarget) {
-            "hata_t" -> when (column) {
-                1 -> hatatSpeed1
-                2 -> hatatSpeed2
-                else -> hatatSpeed3
+            in HATA_TARGETS -> if (hataDeka) {
+                when (column) {
+                    1 -> hataNearDekaSpeed1
+                    2 -> hataNearDekaSpeed2
+                    else -> hataNearDekaSpeed3
+                }
+            } else {
+                when (column) {
+                    1 -> hataNearHutuuSpeed1
+                    2 -> hataNearHutuuSpeed2
+                    else -> hataNearHutuuSpeed3
+                }
             }
-            "hata_o" -> when (column) {
-                1 -> hataoSpeed1
-                2 -> hataoSpeed2
-                else -> hataoSpeed3
-            }
-            else -> when (column) {
-                1 -> hataSpeed1
-                2 -> hataSpeed2
-                else -> hataSpeed3
+            else -> if (hataDeka) {
+                when (column) {
+                    1 -> hataFarDekaSpeed1
+                    2 -> hataFarDekaSpeed2
+                    else -> hataFarDekaSpeed3
+                }
+            } else {
+                when (column) {
+                    1 -> hataFarHutuuSpeed1
+                    2 -> hataFarHutuuSpeed2
+                    else -> hataFarHutuuSpeed3
+                }
             }
         }
         "dekazoukin" -> when (column) {
@@ -1637,6 +1797,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** × ボタン: 旗の turn・速度の組（HATA_T / HATA_O 共通）を HUTUU <-> DEKA と切り替える。 */
+    private fun toggleHataDeka() {
+        hataDeka = !hataDeka
+        appendLog("HATA: ${if (hataDeka) "DEKA" else "HUTUU"}")
+    }
+
     /** 選択中の OBJECT の column（1..3）の速度を delta 分動かす。範囲は物体ごと。 */
     private fun adjustSelectedObjectSpeed(column: Int, delta: Float) {
         if (!settingsSynced) return
@@ -1644,20 +1810,31 @@ class MainActivity : ComponentActivity() {
         fun clamp(v: Float) = v.roundToScale(SPEED_SCALE).coerceIn(speedRangeFor(selectedObject))
         when (selectedObject) {
             "hata" -> when (selectedTarget) {
-                "hata_t" -> when (column) {
-                    1 -> hatatSpeed1 = clamp(hatatSpeed1 + delta)
-                    2 -> hatatSpeed2 = clamp(hatatSpeed2 + delta)
-                    else -> hatatSpeed3 = clamp(hatatSpeed3 + delta)
+                in HATA_TARGETS -> if (hataDeka) {
+                    when (column) {
+                        1 -> hataNearDekaSpeed1 = clamp(hataNearDekaSpeed1 + delta)
+                        2 -> hataNearDekaSpeed2 = clamp(hataNearDekaSpeed2 + delta)
+                        else -> hataNearDekaSpeed3 = clamp(hataNearDekaSpeed3 + delta)
+                    }
+                } else {
+                    when (column) {
+                        1 -> hataNearHutuuSpeed1 = clamp(hataNearHutuuSpeed1 + delta)
+                        2 -> hataNearHutuuSpeed2 = clamp(hataNearHutuuSpeed2 + delta)
+                        else -> hataNearHutuuSpeed3 = clamp(hataNearHutuuSpeed3 + delta)
+                    }
                 }
-                "hata_o" -> when (column) {
-                    1 -> hataoSpeed1 = clamp(hataoSpeed1 + delta)
-                    2 -> hataoSpeed2 = clamp(hataoSpeed2 + delta)
-                    else -> hataoSpeed3 = clamp(hataoSpeed3 + delta)
-                }
-                else -> when (column) {
-                    1 -> hataSpeed1 = clamp(hataSpeed1 + delta)
-                    2 -> hataSpeed2 = clamp(hataSpeed2 + delta)
-                    else -> hataSpeed3 = clamp(hataSpeed3 + delta)
+                else -> if (hataDeka) {
+                    when (column) {
+                        1 -> hataFarDekaSpeed1 = clamp(hataFarDekaSpeed1 + delta)
+                        2 -> hataFarDekaSpeed2 = clamp(hataFarDekaSpeed2 + delta)
+                        else -> hataFarDekaSpeed3 = clamp(hataFarDekaSpeed3 + delta)
+                    }
+                } else {
+                    when (column) {
+                        1 -> hataFarHutuuSpeed1 = clamp(hataFarHutuuSpeed1 + delta)
+                        2 -> hataFarHutuuSpeed2 = clamp(hataFarHutuuSpeed2 + delta)
+                        else -> hataFarHutuuSpeed3 = clamp(hataFarHutuuSpeed3 + delta)
+                    }
                 }
             }
             "dekazoukin" -> {
@@ -1705,18 +1882,23 @@ class MainActivity : ComponentActivity() {
         return super.dispatchKeyEvent(event)
     }
 
+    // パケットの通し番号（0〜1023、10 bit）。send() のたびに 1 増やす（並びは send() のコメント）。
+    // con.py の PACKET_SEQ_SHIFT / PACKET_SEQ_MASK と必ず合わせる。
+    private var packetSeq = 0
+
     private fun send(
         mapId: String,
         vx: Float, vy: Float, w: Float,
-        hataSpeed1: Float, baketuSpeed1: Float,
-        hataSpeed2: Float, baketuSpeed2: Float,
-        hataSpeed3: Float, baketuSpeed3: Float,
+        hataFarHutuuSpeed1: Float, baketuSpeed1: Float,
+        hataFarHutuuSpeed2: Float, baketuSpeed2: Float,
+        hataFarHutuuSpeed3: Float, baketuSpeed3: Float,
         dekazoukinSpeed1: Float, dekazoukinSpeed2: Float, dekazoukinSpeed3: Float,
         baketuBs3Speed1: Float, baketuBs3Speed2: Float, baketuBs3Speed3: Float, baketuBs3: Boolean,
-        hataTTurnX: Float, hataTTurnY: Float, hataTTurnTheta: Float,
-        hataOTurnX: Float, hataOTurnY: Float, hataOTurnTheta: Float, hataO: Boolean,
-        hataTSpeed1: Float, hataTSpeed2: Float, hataTSpeed3: Float,
-        hataOSpeed1: Float, hataOSpeed2: Float, hataOSpeed3: Float,
+        hataHutuuTurnX: Float, hataHutuuTurnY: Float, hataHutuuTurnTheta: Float,
+        hataDekaTurnX: Float, hataDekaTurnY: Float, hataDekaTurnTheta: Float, hataO: Boolean,
+        hataNearHutuuSpeed1: Float, hataNearHutuuSpeed2: Float, hataNearHutuuSpeed3: Float,
+        hataNearDekaSpeed1: Float, hataNearDekaSpeed2: Float, hataNearDekaSpeed3: Float,
+        hataFarDekaSpeed1: Float, hataFarDekaSpeed2: Float, hataFarDekaSpeed3: Float, hataDeka: Boolean,
         hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
         bs2TurnX: Float, bs2TurnY: Float, bs2TurnTheta: Float,
         bs3TurnX: Float, bs3TurnY: Float, bs3TurnTheta: Float,
@@ -1734,21 +1916,22 @@ class MainActivity : ComponentActivity() {
             //  1      u8    map_id（PACKET_MAP_IDS の番号）
             //  2      u8    object（PACKET_OBJECT_IDS の番号）
             //  3      u8    target（PACKET_TARGET_IDS の番号）
-            //  4      u32   ボタン類（bit0 から下の buttons の並び）
+            //  4      u32   bit0-21: ボタン類（bit0 から下の buttons の並び）、bit22-31: 通し番号（packetSeq）
             //  8      i16×3 vx / vy / w
-            // 14      i16×9 turn（bs2 / hatat / hoju の x, y, theta）
-            // 32      i16×9 speed（hata / baketu / dekazoukin の 1..3。baketu は BS2 用）
+            // 14      i16×9 turn（bs2 / 旗の HUTUU 用 / hoju の x, y, theta）
+            // 32      i16×9 speed（旗の FAR の HUTUU 用 / baketu / dekazoukin の 1..3。baketu は BS2 用）
             // 50      i16×3 speed（BS3 用の baketu の 1..3）
             // 56      i16×3 turn（bs3 の x, y, theta）
-            // 62      i16×3 turn（hatao の x, y, theta）
-            // 68      i16×6 speed（hatat の 1..3、hatao の 1..3）
+            // 62      i16×3 turn（旗の DEKA 用の x, y, theta）
+            // 68      i16×6 speed（旗の NEAR の HUTUU 用の 1..3、DEKA 用の 1..3）
+            // 80      i16×3 speed（旗の FAR の DEKA 用の 1..3）
             val buttons = listOf(
                 left, right, up, down,
                 circle, triangle, square, cross,
                 l1, l2, r1, r2,
                 start, select, ps,
                 hataLaser, hojuLaser, t0, synced,
-                baketuBs3, hataO
+                baketuBs3, hataO, hataDeka
             ).foldIndexed(0) { bit, acc, on -> if (on) acc or (1 shl bit) else acc }
 
             val buf = ByteBuffer.allocate(PACKET_SIZE).order(ByteOrder.LITTLE_ENDIAN)
@@ -1756,7 +1939,9 @@ class MainActivity : ComponentActivity() {
             buf.put(packetIndex(PACKET_MAP_IDS, mapId))
             buf.put(packetIndex(PACKET_OBJECT_IDS, selectedObject))
             buf.put(packetIndex(PACKET_TARGET_IDS, selectedTarget))
-            buf.putInt(buttons)
+            // 通し番号は 1 回ごとに 1 増やす。con.py は UDP と ES920LR のうち番号が新しい方を使い、同じ番号や古い番号は捨てる。
+            packetSeq = (packetSeq + 1) and 0x3FF
+            buf.putInt(buttons or (packetSeq shl 22))
             buf.putScaled(vx, STICK_SCALE)
             buf.putScaled(vy, STICK_SCALE)
             buf.putScaled(w, STICK_SCALE)
@@ -1764,15 +1949,15 @@ class MainActivity : ComponentActivity() {
             buf.putScaled(bs2TurnX, TURN_XY_SCALE)
             buf.putScaled(bs2TurnY, TURN_XY_SCALE)
             buf.putScaled(bs2TurnTheta, TURN_THETA_SCALE)
-            buf.putScaled(hataTTurnX, TURN_XY_SCALE)
-            buf.putScaled(hataTTurnY, TURN_XY_SCALE)
-            buf.putScaled(hataTTurnTheta, TURN_THETA_SCALE)
+            buf.putScaled(hataHutuuTurnX, TURN_XY_SCALE)
+            buf.putScaled(hataHutuuTurnY, TURN_XY_SCALE)
+            buf.putScaled(hataHutuuTurnTheta, TURN_THETA_SCALE)
             buf.putScaled(hojuTurnX, TURN_XY_SCALE)
             buf.putScaled(hojuTurnY, TURN_XY_SCALE)
             buf.putScaled(hojuTurnTheta, TURN_THETA_SCALE)
-            buf.putScaled(hataSpeed1, SPEED_SCALE)
-            buf.putScaled(hataSpeed2, SPEED_SCALE)
-            buf.putScaled(hataSpeed3, SPEED_SCALE)
+            buf.putScaled(hataFarHutuuSpeed1, SPEED_SCALE)
+            buf.putScaled(hataFarHutuuSpeed2, SPEED_SCALE)
+            buf.putScaled(hataFarHutuuSpeed3, SPEED_SCALE)
             buf.putScaled(baketuSpeed1, SPEED_SCALE)
             buf.putScaled(baketuSpeed2, SPEED_SCALE)
             buf.putScaled(baketuSpeed3, SPEED_SCALE)
@@ -1785,15 +1970,18 @@ class MainActivity : ComponentActivity() {
             buf.putScaled(bs3TurnX, TURN_XY_SCALE)
             buf.putScaled(bs3TurnY, TURN_XY_SCALE)
             buf.putScaled(bs3TurnTheta, TURN_THETA_SCALE)
-            buf.putScaled(hataOTurnX, TURN_XY_SCALE)
-            buf.putScaled(hataOTurnY, TURN_XY_SCALE)
-            buf.putScaled(hataOTurnTheta, TURN_THETA_SCALE)
-            buf.putScaled(hataTSpeed1, SPEED_SCALE)
-            buf.putScaled(hataTSpeed2, SPEED_SCALE)
-            buf.putScaled(hataTSpeed3, SPEED_SCALE)
-            buf.putScaled(hataOSpeed1, SPEED_SCALE)
-            buf.putScaled(hataOSpeed2, SPEED_SCALE)
-            buf.putScaled(hataOSpeed3, SPEED_SCALE)
+            buf.putScaled(hataDekaTurnX, TURN_XY_SCALE)
+            buf.putScaled(hataDekaTurnY, TURN_XY_SCALE)
+            buf.putScaled(hataDekaTurnTheta, TURN_THETA_SCALE)
+            buf.putScaled(hataNearHutuuSpeed1, SPEED_SCALE)
+            buf.putScaled(hataNearHutuuSpeed2, SPEED_SCALE)
+            buf.putScaled(hataNearHutuuSpeed3, SPEED_SCALE)
+            buf.putScaled(hataNearDekaSpeed1, SPEED_SCALE)
+            buf.putScaled(hataNearDekaSpeed2, SPEED_SCALE)
+            buf.putScaled(hataNearDekaSpeed3, SPEED_SCALE)
+            buf.putScaled(hataFarDekaSpeed1, SPEED_SCALE)
+            buf.putScaled(hataFarDekaSpeed2, SPEED_SCALE)
+            buf.putScaled(hataFarDekaSpeed3, SPEED_SCALE)
 
             sendTime = System.nanoTime()
             // LoRa にも同じものを渡す（送るのは Es920Link のループ。ここでは待たない）。
@@ -2140,6 +2328,10 @@ fun TeamSelectionScreen(
     // 起動時にモバイル回線がつながっていたら true。背景の点滅と警告を出す。
     networkWarning: Boolean,
     onToggleFlip: () -> Unit,
+    // ES920LR のチャンネルの表示と操作（右側のパネル）
+    lora: LoraChannelUi,
+    onScanLora: () -> Unit,
+    onSelectLoraChannel: (Int) -> Unit,
     onSelectTeam: (mapStr: String) -> Unit
 ) {
     Box(
@@ -2150,70 +2342,230 @@ fun TeamSelectionScreen(
         contentAlignment = Alignment.Center
     ) {
         if (networkWarning) NetworkWarningBanner(Modifier.align(Alignment.TopCenter))
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(32.dp)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(32.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "SELECT FIELD SIDE",
-                fontSize = 28.sp,
-                fontWeight = FontWeight.Bold,
-                color = ControllerColors.TextPrimary,
-                letterSpacing = 2.sp
-            )
-
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(40.dp)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(32.dp)
             ) {
-                Button(
-                    onClick = { onSelectTeam("redmap") },
-                    modifier = Modifier
-                        .size(width = 180.dp, height = 120.dp)
-                        .border(1.dp, ControllerColors.Danger.copy(alpha = 0.65f), RoundedCornerShape(12.dp)),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF531920)
-                    ),
-                    elevation = ButtonDefaults.buttonElevation(0.dp)
+                Text(
+                    text = "SELECT FIELD SIDE",
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = ControllerColors.TextPrimary,
+                    letterSpacing = 2.sp
+                )
+    
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(40.dp)
                 ) {
-                    Text(
-                        text = "RED",
-                        fontSize = 32.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = ControllerColors.TextPrimary,
-                        letterSpacing = 2.sp
-                    )
+                    Button(
+                        onClick = { onSelectTeam("redmap") },
+                        modifier = Modifier
+                            .size(width = 180.dp, height = 120.dp)
+                            .border(1.dp, ControllerColors.Danger.copy(alpha = 0.65f), RoundedCornerShape(12.dp)),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF531920)
+                        ),
+                        elevation = ButtonDefaults.buttonElevation(0.dp)
+                    ) {
+                        Text(
+                            text = "RED",
+                            fontSize = 32.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = ControllerColors.TextPrimary,
+                            letterSpacing = 2.sp
+                        )
+                    }
+    
+                    Button(
+                        onClick = { onSelectTeam("bluemap") },
+                        modifier = Modifier
+                            .size(width = 180.dp, height = 120.dp)
+                            .border(1.dp, ControllerColors.Accent.copy(alpha = 0.65f), RoundedCornerShape(12.dp)),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF123D59)
+                        ),
+                        elevation = ButtonDefaults.buttonElevation(0.dp)
+                    ) {
+                        Text(
+                            text = "BLUE",
+                            fontSize = 32.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = ControllerColors.TextPrimary,
+                            letterSpacing = 2.sp
+                        )
+                    }
                 }
+    
+                HudButton(
+                    text = if (isFlipped) "FLIPPED  /  180�" else "ROTATE SCREEN  /  180�",
+                    onClick = onToggleFlip,
+                    modifier = Modifier.width(220.dp),
+                    containerColor = if (isFlipped) Color(0xFF5A431B) else ControllerColors.Surface2,
+                    contentColor = if (isFlipped) ControllerColors.Warning else ControllerColors.TextPrimary,
+                    height = 50.dp,
+                    accent = if (isFlipped) ControllerColors.Warning else ControllerColors.Border
+                )
+            }
+            LoraChannelPanel(lora = lora, onScan = onScanLora, onSelect = onSelectLoraChannel)
+        }
+    }
+}
 
-                Button(
-                    onClick = { onSelectTeam("bluemap") },
-                    modifier = Modifier
-                        .size(width = 180.dp, height = 120.dp)
-                        .border(1.dp, ControllerColors.Accent.copy(alpha = 0.65f), RoundedCornerShape(12.dp)),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF123D59)
-                    ),
-                    elevation = ButtonDefaults.buttonElevation(0.dp)
-                ) {
-                    Text(
-                        text = "BLUE",
-                        fontSize = 32.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = ControllerColors.TextPrimary,
-                        letterSpacing = 2.sp
+/** フィールド選択画面の LORA CHANNEL パネルに渡すもの。 */
+class LoraChannelUi(
+    val profileName: String,
+    val channels: IntRange,
+    val freqMhz: (Int) -> Double,
+    /** 選んだチャンネル */
+    val selected: Int,
+    /** モジュールに設定してあるチャンネル（切り替え中は selected と違う） */
+    val active: Int,
+    val state: Es920State,
+    val scan: List<Es920ChannelScan>,
+    /** 今スキャンで試しているチャンネル（0 はスキャンしていない） */
+    val scanningCh: Int,
+    /** スキャンが終わった時刻（0 はまだ） */
+    val scanAtMs: Long,
+    /** 最後の 5 秒ごとの送信の統計（コントローラーの画面で送っていた間のもの） */
+    val stats: Es920Stats?
+)
+
+// LORA CHANNEL パネルの 1 行に並べるチャンネルの数。
+private const val LORA_TILES_PER_ROW = 5
+
+/** NG 102 の割合の色。15 回中 1 回までは空いているとみる。 */
+private fun loraBusyColor(rate: Double): Color = when {
+    rate < 0.1 -> ControllerColors.Success
+    rate < 0.3 -> ControllerColors.Warning
+    else -> ControllerColors.Danger
+}
+
+/**
+ * ES920LR のチャンネルを選ぶパネル。SCAN で全チャンネルを試し、NG 102（キャリアセンスで送れなかった =
+ * 誰かが使っている）の割合をタイルに出す。タイルを押すとそのチャンネルに切り替える（PC は追いかけてくる）。
+ */
+@Composable
+private fun LoraChannelPanel(lora: LoraChannelUi, onScan: () -> Unit, onSelect: (Int) -> Unit) {
+    val scanByCh = lora.scan.associateBy { it.channel }
+    val scanning = lora.scanningCh != 0
+    HudPanel(modifier = Modifier.width(300.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Box(modifier = Modifier.weight(1f)) { HudSectionTitle(text = "LORA CHANNEL") }
+            HudButton(
+                text = if (scanning) "SCAN ${lora.scanningCh}/${lora.channels.last}" else "SCAN",
+                onClick = onScan,
+                modifier = Modifier.width(120.dp),
+                enabled = lora.state == Es920State.READY && !scanning,
+                height = 36.dp,
+                fontSize = 13.sp,
+                accent = ControllerColors.Accent
+            )
+        }
+        // 今のチャンネルとモジュールの状態
+        val (stateText, stateColor) = when {
+            lora.state == Es920State.NO_DEVICE -> "NO USB" to ControllerColors.Danger
+            lora.state == Es920State.STARTING -> "START..." to ControllerColors.Warning
+            scanning -> "SCANNING" to ControllerColors.Warning
+            lora.selected != lora.active -> "SWITCHING" to ControllerColors.Warning
+            else -> "READY" to ControllerColors.Success
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "CH ${lora.selected}  ${"%.1f".format(lora.freqMhz(lora.selected))} MHz  ",
+                color = ControllerColors.TextPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Text(text = stateText, color = stateColor, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+        // 直近の送信の統計（NG 102 が多ければ、今のチャンネルが混んでいる）
+        val stats = lora.stats
+        Text(
+            text = if (stats == null) "${lora.profileName} · 送信の統計はまだない"
+            else "直近 5 秒 ch${stats.channel}: %.1f Hz · NG102 %d/%d (%.0f%%)".format(
+                stats.hz, stats.busy, stats.attempts, stats.busyRate * 100),
+            color = if (stats == null) ControllerColors.TextSecondary else loraBusyColor(stats.busyRate),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold
+        )
+        // チャンネルの一覧。数字の下は、スキャンで NG 102 が返った割合
+        lora.channels.chunked(LORA_TILES_PER_ROW).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                row.forEach { ch ->
+                    LoraChannelTile(
+                        ch = ch,
+                        result = scanByCh[ch],
+                        selected = ch == lora.selected,
+                        scanningNow = ch == lora.scanningCh,
+                        enabled = !scanning,
+                        onClick = { onSelect(ch) }
                     )
                 }
             }
+        }
+        Text(
+            text = "% = NG 102（誰かが使っていて送れなかった）の割合。" +
+                "押すと切り替え。${ES920_SLOW_CHANNELS.first}〜${ES920_SLOW_CHANNELS.last} は送るたび 50 ms 休むので遅い" +
+                if (lora.scanAtMs > 0) "。SCAN ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(lora.scanAtMs)}" else "",
+            color = ControllerColors.TextSecondary,
+            fontSize = 10.sp,
+            lineHeight = 13.sp
+        )
+    }
+}
 
-            HudButton(
-                text = if (isFlipped) "FLIPPED  /  180�" else "ROTATE SCREEN  /  180�",
-                onClick = onToggleFlip,
-                modifier = Modifier.width(220.dp),
-                containerColor = if (isFlipped) Color(0xFF5A431B) else ControllerColors.Surface2,
-                contentColor = if (isFlipped) ControllerColors.Warning else ControllerColors.TextPrimary,
-                height = 50.dp,
-                accent = if (isFlipped) ControllerColors.Warning else ControllerColors.Border
+@Composable
+private fun LoraChannelTile(
+    ch: Int,
+    result: Es920ChannelScan?,
+    selected: Boolean,
+    scanningNow: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    val shape = RoundedCornerShape(6.dp)
+    val color = result?.let { loraBusyColor(it.busyRate) } ?: ControllerColors.TextMuted
+    Box(
+        modifier = Modifier
+            .size(width = 52.dp, height = 38.dp)
+            .background(if (selected) ControllerColors.Accent.copy(alpha = 0.22f) else ControllerColors.Surface2, shape)
+            .border(
+                if (selected || scanningNow) 2.dp else 1.dp,
+                when {
+                    selected -> ControllerColors.Accent
+                    scanningNow -> ControllerColors.Warning
+                    else -> ControllerColors.Border
+                },
+                shape
+            )
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "$ch",
+                color = if (ch in ES920_SLOW_CHANNELS) ControllerColors.TextSecondary else ControllerColors.TextPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                lineHeight = 15.sp
+            )
+            Text(
+                text = when {
+                    scanningNow -> "..."
+                    result == null -> "--"
+                    result.ok + result.busy == 0 -> "ERR"   // OK も NG 102 も返らなかった（ほかの NG・時間切れだけ）
+                    else -> "${(result.busyRate * 100).roundToInt()}%"
+                },
+                color = if (scanningNow) ControllerColors.Warning else color,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                lineHeight = 12.sp
             )
         }
     }
@@ -2275,6 +2627,8 @@ private const val TARGET_LOCK_INTERVAL_MS = 50L
 // 画面の LINK の表示を作り直す間隔と、生きているとみなす時間 [ms]。
 // LoRa は Wi-Fi が切れている間 200 ms ごとに PC の行を受け取るので、5 回続けて落としたら NG にする。
 private const val LINK_REFRESH_MS = 250L
+// ES920LR のチャンネル（フィールド選択画面で選んだもの）を残す SharedPreferences のキー。
+private const val PREF_ES920_CHANNEL = "es920_channel"
 private const val LINK_WIFI_TIMEOUT_MS = 500L
 private const val LINK_LORA_TIMEOUT_MS = 1000L
 
@@ -2415,8 +2769,8 @@ fun ControllerUI(
     currentVx: Float,
     currentVy: Float,
     currentW: Float,
-    hataTTurnX: Float, hataTTurnY: Float, hataTTurnTheta: Float,
-    hataOTurnX: Float, hataOTurnY: Float, hataOTurnTheta: Float,
+    hataHutuuTurnX: Float, hataHutuuTurnY: Float, hataHutuuTurnTheta: Float,
+    hataDekaTurnX: Float, hataDekaTurnY: Float, hataDekaTurnTheta: Float,
     hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
     bs2TurnX: Float, bs2TurnY: Float, bs2TurnTheta: Float,
     bs3TurnX: Float, bs3TurnY: Float, bs3TurnTheta: Float,
@@ -2450,6 +2804,8 @@ fun ControllerUI(
     settingsSynced: Boolean,
     // 最後に選んだ BS が BS3 なら true。バケツの SPEED ADJUST は BS3 用の速度を出している。
     baketuBs3: Boolean,
+    // × で DEKA を選んでいれば true。旗の TURN ADJUST と、HATA_T / HATA_O の SPEED ADJUST は DEKA 用を出している。
+    hataDeka: Boolean,
     // 画面の LINK。Wi-Fi が生きているか / LoRa の状態の文字 / LoRa が生きているか。
     linkWifiOk: Boolean,
     linkLoraText: String,
@@ -2713,12 +3069,12 @@ fun ControllerUI(
                 else -> ControllerColors.Warning
             }
             // バケツは BS2 / BS3 で速度が別なので、どちらを出しているかを見出しに出す（幅が狭いので「バケツ」の代わり）。
-            // 旗は HATA_T / HATA_O / それ以外で速度が別なので、どれを出しているかを見出しに出す。
+            // 旗は NEAR（HATA_T / HATA_O）/ FAR（それ以外）それぞれ HUTUU / DEKA で速度が別なので、どれを出しているかを見出しに出す
+            // （幅が狭いので「HATA」は付けない）。
             val speedTargetName = when {
                 selectedObject == "baketu" -> if (baketuBs3) "BS3" else "BS2"
-                selectedObject == "hata" && selectedTarget == "hata_t" -> "HATA_T"
-                selectedObject == "hata" && selectedTarget == "hata_o" -> "HATA_O"
-                selectedObject == "hata" -> "HATA"
+                selectedObject == "hata" ->
+                    "${if (selectedTarget in HATA_TARGETS) "NEAR" else "FAR"} ${if (hataDeka) "DEKA" else "HUTUU"}"
                 else -> objectDisplayName(selectedObject)
             }
             HudPanel(modifier = Modifier.fillMaxWidth().weight(1f), accent = speedAccent, contentPadding = 4.dp) {
@@ -2810,7 +3166,7 @@ fun ControllerUI(
             contentPadding = 4.dp
         ) {
             HudSectionTitle(
-                if (settingsSynced) "TURN ADJUST  /  ${selectedTurnTarget.displayName()}" else "TURN ADJUST  /  SYNC...",
+                if (settingsSynced) "TURN ADJUST  /  ${selectedTurnTarget.displayName(hataDeka)}" else "TURN ADJUST  /  SYNC...",
                 if (settingsSynced) ControllerColors.Warning else ControllerColors.Danger,
                 10.sp
             )
@@ -2818,8 +3174,8 @@ fun ControllerUI(
             Column {
                 Text("BS2    X ${"%.2f".format(bs2TurnX)} Y ${"%.2f".format(bs2TurnY)} T ${"%.2f".format(bs2TurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
                 Text("BS3    X ${"%.2f".format(bs3TurnX)} Y ${"%.2f".format(bs3TurnY)} T ${"%.2f".format(bs3TurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
-                Text("HATA_T X ${"%.2f".format(hataTTurnX)} Y ${"%.2f".format(hataTTurnY)} T ${"%.2f".format(hataTTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
-                Text("HATA_O X ${"%.2f".format(hataOTurnX)} Y ${"%.2f".format(hataOTurnY)} T ${"%.2f".format(hataOTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
+                Text("HUTUU X ${"%.2f".format(hataHutuuTurnX)} Y ${"%.2f".format(hataHutuuTurnY)} T ${"%.2f".format(hataHutuuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
+                Text("DEKA X ${"%.2f".format(hataDekaTurnX)} Y ${"%.2f".format(hataDekaTurnY)} T ${"%.2f".format(hataDekaTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
                 Text("HOJU   X ${"%.2f".format(hojuTurnX)} Y ${"%.2f".format(hojuTurnY)} T ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
             }
         }
@@ -2887,17 +3243,17 @@ fun ControllerUI(
     }
 }
 
-fun TurnTarget.displayName(): String = when (this) {
-    TurnTarget.HATA_T -> "HATA_T"
-    TurnTarget.HATA_O -> "HATA_O"
+/** TURN ADJUST の見出し。旗は × で選んでいる方（HUTUU / DEKA）も出す。 */
+fun TurnTarget.displayName(hataDeka: Boolean): String = when (this) {
+    TurnTarget.HATA -> if (hataDeka) "HATA DEKA" else "HATA HUTUU"
     TurnTarget.HOJU -> "HOJU"
     TurnTarget.BS2 -> "BS2"
     TurnTarget.BS3 -> "BS3"
 }
 
-/** 押しっぱなしで連続調整する対象か。旗を狙う HATA_T / HATA_O が対象。 */
+/** 押しっぱなしで連続調整する対象か。旗を狙う HATA が対象。 */
 private fun TurnTarget.usesHoldRepeat(): Boolean =
-    this == TurnTarget.HATA_T || this == TurnTarget.HATA_O
+    this == TurnTarget.HATA
 
 /** send() ?????? "object" ?????????????? */
 private fun objectDisplayName(id: String): String =
