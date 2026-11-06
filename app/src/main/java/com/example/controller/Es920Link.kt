@@ -101,7 +101,7 @@ private val ES920_PROFILE = when (ES920_PROTOCOL) {
         airtimeBaseUs = 9000L,
         airtimePerByteUs = 430L,
         periodFastMs = 0L,
-        periodSyncMs = 300L,   // PC の返事は 3 行（1 行 約 35 ms）。それを待てるだけ受信する
+        periodSyncMs = 0L,     // SYNC 待ちでも同じ。PC の返事（設定値）は受信の印で受ける（ES920_SYNC_LISTEN_*）
         periodSlowMs = 0L,
         listenMs = 0L          // 毎回 30 ms 空けても LoRa の 1 行（約 27.5 ms）はほぼ入らないので、まとめて受信する（ES920_POSE_*）
     )
@@ -164,8 +164,9 @@ private const val LORA_CHANNEL_TAG: Byte = 0x43
 private const val ES920_HINT_OK = 3
 private const val ES920_HINT_TRIES = 10
 // スキャン: 1 チャンネルにつき何回送ってみるか（NG 102 の割合を見る）。
-// 1 チャンネルは設定のかけ直し 約 0.4 秒 + 送信（8〜19 は 1 回 約 15 ms、1〜7 は 50 ms 休むので 約 65 ms）。19 チャンネルで 約 15 秒。
-private const val ES920_SCAN_PROBES = 15
+// 1 チャンネルは設定のかけ直し 約 0.4 秒 + 送信（8〜19 は 1 回 約 15 ms、1〜7 は 50 ms 休むので 約 65 ms）。19 チャンネルで 約 11 秒。
+// 使用中のチャンネルは NG 102 が 1 回 約 0.1 秒かかる（全チャンネル使用中なら 約 17 秒）。
+private const val ES920_SCAN_PROBES = 5
 // スキャン中、1 チャンネルでこの回数返事が来なければ、モジュールがおかしいとみて開き直す。
 private const val ES920_SCAN_MAX_TIMEOUTS = 2
 // UDP の自己位置がこの時間届いていなければ Wi-Fi が切れたとみなし、周期を periodFastMs にして、状態の行も受信する。
@@ -270,6 +271,11 @@ private const val LORA_SETTINGS_CHUNK_SIZE = 3 + LORA_CHUNK_SIZE
 // ES920LR で届いた自己位置は画面に出すだけで、Wi-Fi の生死（wifiAlive）には使わない。
 private const val ES920_POSE_INTERVAL_MS = 200L
 private const val ES920_POSE_LISTEN_MS = 120L
+// SYNC 待ちで periodSyncMs が 0 のとき（LoRa）は周期の残りで受信できないので、SYNC 待ちでも印を付ける。
+// con.py は印を見たら、設定値の 3 行（1 行 約 35 ms）→ ログの行 → 状態の行、の順に送ってくる。
+// それが入るよう 1 回の受信を長くして、回数を減らす。1 秒に 1 回 250 ms なので、操作は計算で 約 21 Hz。
+private const val ES920_SYNC_LISTEN_INTERVAL_MS = 1000L
+private const val ES920_SYNC_LISTEN_MS = 250L
 private const val LORA_LISTEN_FLAG = 0x80
 private const val LORA_STATUS_TAG: Byte = 0x50
 private const val LORA_POSE_SIZE = 15
@@ -741,9 +747,10 @@ class Es920Link(
             } ?: continue
             val cycleStart = System.currentTimeMillis()
             val cyclePeriod = if (airtimeTest) 0L else period()
-            // Wi-Fi が切れていて SYNC 待ちでなければ、1 秒に 1 回、送ったあとに自己位置を受信する時間をとる。
-            val poseWindow = !wifiAlive() && !waitingSettings() &&
-                cycleStart - lastPoseWindowMs >= ES920_POSE_INTERVAL_MS
+            // Wi-Fi が切れている間は、ときどき送ったあとに受信する時間をとる。SYNC 待ちは周期の残りで受信できるときは要らない。
+            val syncWindow = waitingSettings() && ES920_PROFILE.periodSyncMs == 0L
+            val poseWindow = !wifiAlive() && (syncWindow || !waitingSettings()) &&
+                cycleStart - lastPoseWindowMs >= (if (syncWindow) ES920_SYNC_LISTEN_INTERVAL_MS else ES920_POSE_INTERVAL_MS)
             val frame = encodeFrame(tx, poseWindow, cycleStart)
             if (frame.size > LORA_CONTROL_SIZE) settingsFrames++
             val wireSize = if (ES920_BINARY) frame.size else (frame.size + 2) / 3 * 4
@@ -803,7 +810,11 @@ class Es920Link(
             }
             // 受信の時間。途中で Wi-Fi が切れて周期が短くなったら、すぐ次を送る。
             // 1 回送ったら、最低 listenMs（印を付けたときは ES920_POSE_LISTEN_MS）は受信する（周期の残りのほうが長ければそちら）。
-            val minListen = if (poseWindow && !hold) ES920_POSE_LISTEN_MS else ES920_PROFILE.listenMs
+            val minListen = when {
+                !poseWindow || hold -> ES920_PROFILE.listenMs
+                syncWindow -> ES920_SYNC_LISTEN_MS
+                else -> ES920_POSE_LISTEN_MS
+            }
             if (poseWindow && !hold) lastPoseWindowMs = cycleStart
             val listenEnd = if (hold) cycleStart + cyclePeriod else maxOf(cycleStart + cyclePeriod, replyAt + minListen)
             // 印を付けた回は、状態の行（PC が最後に送る）が届いたらすぐ送信に戻る。
