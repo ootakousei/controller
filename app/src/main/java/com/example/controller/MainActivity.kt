@@ -598,7 +598,9 @@ class MainActivity : ComponentActivity() {
     private var hataDekaFired = false
 
     // ?????1????????
-    private val speedStep = 0.01f
+    // バケツ（BS2 / BS3）は 0.01、それ以外（旗 / HOJU。移動バケツの DIF も含む）は 0.02。押したときの selectedSpeed で決まる。
+    private val speedStep: Float
+        get() = if (selectedSpeed == "baketu") 0.01f else 0.02f
 
     private val t0CooldownSeconds = 2.0f   // ?????(?)???????????????
     private var t0Locked by mutableStateOf(false)  // true ??????????
@@ -844,7 +846,12 @@ class MainActivity : ComponentActivity() {
                 }
             } else {
                 // HOJU???????????????1????
-                stopHataTurnRepeat()
+                // 移動バケツ中の theta（L2 / R2）だけは押しっぱなしで連続調整する（1回目は下の押した瞬間の処理）。
+                if (idoubakeThetaHoldRepeat() && (currentL2 || currentR2)) {
+                    startHataTurnRepeat()
+                } else {
+                    stopHataTurnRepeat()
+                }
 
                 if (currentDpadLeft && !prevDpadLeft) {
                     adjustSelectedTurn(dx = -turnXYStep)
@@ -910,12 +917,14 @@ class MainActivity : ComponentActivity() {
             while (isActive) {
                 delay(hataTurnRepeatIntervalMs)
 
-                if (!selectedTurnTarget.usesHoldRepeat()) break
+                // 旗は全部の軸、移動バケツは theta（L2 / R2）だけを連続調整する。
+                val allAxes = selectedTurnTarget.usesHoldRepeat()
+                if (!allAxes && !idoubakeThetaHoldRepeat()) break
 
-                val dpadLeft = left
-                val dpadRight = right
-                val dpadUp = up
-                val dpadDown = down
+                val dpadLeft = allAxes && left
+                val dpadRight = allAxes && right
+                val dpadUp = allAxes && up
+                val dpadDown = allAxes && down
                 val l2Pressed = l2
                 val r2Pressed = r2
 
@@ -936,6 +945,10 @@ class MainActivity : ComponentActivity() {
         hataTurnRepeatJob?.cancel()
         hataTurnRepeatJob = null
     }
+
+    /** 移動バケツの turn を調整中か。この間は theta（L2 / R2）だけ押しっぱなしで連続調整する。 */
+    private fun idoubakeThetaHoldRepeat(): Boolean =
+        selectedTurnTarget == TurnTarget.HOJU && hojuIdoubake
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (currentScreen == ScreenState.CONTROLLER &&
@@ -2021,6 +2034,8 @@ class MainActivity : ComponentActivity() {
             if (!hojuIdoubake && !hojuLineStickTilted()) {
                 hojuIdoubake = true
                 appendLog("HOJU TURN: IDOUBAKE")
+                // L2 / R2 を押したまま入ったときも連続調整を始める
+                if (l2 || r2) startHataTurnRepeat()
             }
             return
         }
@@ -2185,7 +2200,7 @@ class MainActivity : ComponentActivity() {
     private fun adjustSelectedObjectSpeedAll(delta: Float) {
         if (!settingsSynced) return
         val range = speedRangeFor(selectedSpeed)
-        // 0.01 刻みの足し引きで誤差が乗るので、端との比較は少し余裕を持たせる（SpeedAdjustRow と同じ）。
+        // speedStep の足し引きで誤差が乗るので、端との比較は少し余裕を持たせる（SpeedAdjustRow と同じ）。
         val fits = (1..3).all { column ->
             val v = (selectedObjectSpeed(column) + delta).roundToScale(SPEED_SCALE)
             v >= range.start - 1e-4f && v <= range.endInclusive + 1e-4f
@@ -2204,7 +2219,7 @@ class MainActivity : ComponentActivity() {
     /** 選択中の OBJECT の column（1..3）の速度を delta 分動かす。範囲は物体ごと。 */
     private fun adjustSelectedObjectSpeed(column: Int, delta: Float) {
         if (!settingsSynced) return
-        // 送るときの刻みに丸めてから範囲に収める（0.01 の足し引きで桁が伸びないように）。
+        // 送るときの刻みに丸めてから範囲に収める（speedStep の足し引きで桁が伸びないように）。
         fun clamp(v: Float) = v.roundToScale(SPEED_SCALE).coerceIn(speedRangeFor(selectedSpeed))
         when (selectedSpeed) {
             "hata" -> when {
