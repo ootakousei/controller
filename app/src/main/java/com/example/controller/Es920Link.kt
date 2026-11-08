@@ -34,12 +34,13 @@ import java.util.concurrent.atomic.AtomicInteger
 
 // --- 無線の設定。PC 側（~/kazusa/ver0/es920lr/config/es920lr.yaml）の値をそのまま使う。
 // 違うのは次の 2 つだけ。
-//   - node / ownid / dstid は PC と逆向き（PC: enddevice 0001 -> 0000、スマホ: coordinator 0000 -> 0001）
+//   - node / ownid / dstid は PC と逆向き（組 A は PC: enddevice 0001 -> 0000、スマホ: coordinator 0000 -> 0001。
+//     組 B は 0003 -> 0002 / 0002 -> 0003。下の ES920_LINK_COUNT の説明）
 //   - retry は 0（PC 側は 3。ただし両側とも ACK なしなので使われない）
 // yaml の protocol / panid（LoRa なら bw_khz / sf、FSK なら rate_kbps）を変えたら、
 // ここも同じ値にすること（そろっていないと届かない）。
-// チャンネルはフィールド選択画面で選ぶ（SharedPreferences に残る）。PC 側は届かなくなると全チャンネルを探して
-// 追いかけてくるので、yaml の channel（探し始めるチャンネル）とそろえなくても届く。
+// チャンネルは組ごとにフィールド選択画面で選ぶ（SharedPreferences に残る）。PC 側は届かなくなると全チャンネルを探して
+// 追いかけてくるので、PC 側の channel（探し始めるチャンネル）とそろえなくても届く。
 // 設定はフラッシュに保存しない（起動のたびに書き込む）。大会ではチャンネルを決まったものにする。
 private const val ES920_BAUDRATE = 115200           // yaml の baudrate
 private const val ES920_VENDOR_ID = 0x1a86          // CH340 系
@@ -49,9 +50,27 @@ private enum class Es920Protocol { LORA, FSK }
 // ★ LoRa / FSK の切り替え。PC 側 es920lr.yaml の protocol と必ずそろえる。
 private val ES920_PROTOCOL = Es920Protocol.LORA
 
-// チャンネルの既定値（まだ画面で選んでいないとき）。PC 側 es920lr.yaml の channel と同じにしておくと、すぐ届く。
+// --- 2 組を並べて使う（2026-11-06〜）。スマホに 2 台、PC に 2 台挿し、組ごとに別のチャンネルで同時に送る。
+//   組 A: スマホ 0000 → PC 0001（前からの組）、組 B: スマホ 0002 → PC 0003。PAN ID は同じ。
+//   PC 側は es920lr ノードを 2 つ動かす（B は名前空間 es920lr_b。ownid / dstid は launch で入れる）。
+//   PC のノードは送り元 ID が相手のものだけを受け取るので、探しているときに別の組の行を拾っても止まらない。
+//   どちらの組も、その時点の最新のパケット（通し番号入り）を待たずに送る。片方の組が送れなくても（混信・抜けた・PC 側が落ちた）
+//   もう片方だけで届くよう、2 組で同じ番号を重ねて送ってよい（落ちにくさを優先する）。
+//   con.py は両方を受け取り、今までどおり番号が新しいものだけを使う（同じ番号の 2 つ目は捨てる）。
+//   同じ番号は 2 組で中身もそろえる（短い押しを足すかどうかも同じ。Es920Group.pressedFor）。
+//   どのモジュールがどの組かは決めていない。空いているモジュールを開き、起動のたびに組の ID を書き込む。
+const val ES920_LINK_COUNT = 2
+val ES920_LINK_NAMES = listOf("A", "B")
+// チャンネルの既定値（まだ画面で選んでいないとき）。PC 側の launch の channel と同じにしておくと、すぐ届く。
 // LoRa 250kHz と FSK 100 / 150kbps はどちらも 1〜19 で、10 = 924.3 MHz（同じ周波数）。
-const val ES920_DEFAULT_CHANNEL = 10
+// 2 台のモジュールはスマホの上で数 cm しか離れていないので、片方の送信がもう片方の受信を邪魔しないよう離しておく。
+val ES920_DEFAULT_CHANNELS = listOf(10, 16)
+// 2 組のチャンネルがこれより近いと、画面で注意を出す（同じチャンネルは選べない）。
+const val ES920_MIN_CHANNEL_GAP = 3
+/** 組の自分の ID（スマホ側）。A: 0000、B: 0002。 */
+private fun es920OwnId(link: Int) = "%04X".format(link * 2)
+/** 組の相手の ID（PC 側）。A: 0001、B: 0003。 */
+private fun es920DstId(link: Int) = "%04X".format(link * 2 + 1)
 // 1〜7 は送るたびにモジュールが 50 ms 休む（遅い）。8〜19 は休止 2 ms だが、1 時間の送信時間の合計に上限がある（アプリでは数えていない）。
 val ES920_SLOW_CHANNELS = 1..7
 
@@ -61,8 +80,8 @@ private class Es920Profile(
     /** protocol とプロトコル専用の設定。コマンドの体系が変わるので protocol を最初に送る。 */
     val radioCommands: List<String>,
     /**
-     * 設定値を送るときの形。true: 1 回 50 バイトまで（LoRa）なので、操作 + 設定値 24 バイトずつの 40 バイトを 3 回。
-     * false: 操作 + 設定値 72 バイトの 88 バイトを 1 回（FSK は 225 バイトまで）。設定値を送らない回は、どちらも 16 バイト。
+     * 設定値を送るときの形。true: 1 回 50 バイトまで（LoRa）なので、操作 + 設定値 29 バイトずつの 45 バイトを 3 回。
+     * false: 操作 + 設定値 87 バイトの 103 バイトを 1 回（FSK は 225 バイトまで）。設定値を送らない回は、どちらも 16 バイト。
      */
     val chunked: Boolean,
     /** 1 回の送信の空中時間の見積もり [µs] = base + perByte × 文字数。少し多めにしてある。 */
@@ -124,13 +143,13 @@ private val ES920_PROFILE = when (ES920_PROTOCOL) {
     )
 }
 
-/** モジュールに書き込む設定（チャンネル ch）。 */
-private fun es920Commands(ch: Int) = ES920_PROFILE.radioCommands + listOf(
+/** モジュールに書き込む設定（チャンネル ch、組 link）。 */
+private fun es920Commands(ch: Int, link: Int) = ES920_PROFILE.radioCommands + listOf(
     "node 1",        // coordinator（PC 側は enddevice）
     "channel $ch",
     "panid 5A2C",    // panid: 5A2C
-    "ownid 0000",    // PC 側の dstid
-    "dstid 0001",    // PC 側の ownid
+    "ownid ${es920OwnId(link)}",    // PC 側の dstid
+    "dstid ${es920DstId(link)}",    // PC 側の ownid
     "ack 2",         // ACK なし（PC 側も ack: false）。最新の操作を送り続けるので、届いたかの確認と再送はしない
     "retry 0",
     "transmode 1",   // 送り先は dstid に固定（PC 側ノードと同じ）
@@ -189,6 +208,11 @@ private const val BINARY_MAX_FRAME = 16 + 225
 private const val BINARY_FRAME_TIMEOUT_MS = 200L
 
 private const val ES920_PERMISSION_ACTION = "com.example.controller.ES920_USB_PERMISSION"
+// USB の許可ダイアログの結果がこの時間来なければ、頼み直す [ms]（ダイアログが出なかったときに許可待ちのまま止まらないように）
+private const val ES920_PERMISSION_TIMEOUT_MS = 20_000L
+// 挿したモジュールに許可が無くても、最初に見つけてからこの時間は許可ダイアログを出さない [ms]（2026-11-08）。
+// 「常に」を選んであれば、Android が挿したときに許可を出す（UsbAttachActivity）ので、それを待つ
+private const val ES920_AUTO_GRANT_WAIT_MS = 2000L
 
 // --- モジュールとの間の形（PC 側 es920lr.yaml の format と必ずそろえる。そろっていないと読めない）。
 // true : BINARY（format 2）。[長さ 1 バイト] + 中身 で送り、受け取りも [長さ] + RSSI・PAN ID・ID（文字）+ 中身。改行なし。
@@ -200,14 +224,14 @@ private const val ES920_BINARY = true
 // --- 無線で送る 1 回分の中身（PC 側は con.py の decode_lora_bytes / LoraAssembler。必ず合わせる）
 //   offset  size  中身
 //    0      14    パケットの 0〜13 バイト（PACKET_VERSION / map / object / target / ボタン・通し番号 / vx vy w）
-//   14      1     bit0-1: 設定値の何番目の 24 バイトか（0〜2。24 バイトに分けて送るときだけ意味がある）
+//   14      1     bit0-1: 設定値の何番目の 29 バイトか（0〜2。29 バイトに分けて送るときだけ意味がある）
 //                 bit7  : このあと受信する印（LORA_LISTEN_FLAG）
 //   15      1     設定値の番号（0〜255）。設定値・マップ・synced のどれかが変わるたびに 1 増やす
 //   16      ...   設定値。種類は長さで決まる:
 //     16 バイト（操作だけ）: 設定値なし。ふだんはこれ（短いので速く送れる）
-//     40 バイト（分割）    : 設定値の 24×n 〜 24×n+23 バイト（LoRa。1 回 50 バイトまでなので 3 回に分ける）
-//     88 バイト（まるごと）: 設定値 72 バイト（FSK）
-// 設定値はパケットの 14〜85 バイトと同じ並び・倍率。
+//     45 バイト（分割）    : 設定値の 29×n 〜 29×n+28 バイト（LoRa。1 回 50 バイトまでなので 3 回に分ける）
+//     103 バイト（まるごと）: 設定値 87 バイト（FSK）
+// 設定値はパケットの 14〜100 バイトと同じ並び・倍率（最後の 1 バイトは空き）。2026-11-08 に 28 → 29 バイト（version 18）。
 // 番号を進めたときに設定値を写し取り、その番号の分割はすべて写しから送る（別の時刻の値を混ぜないため）。
 // 設定値を送るのは、変わったとき（ES920_SETTINGS_ROUNDS_ON_CHANGE 回ぶん）と、PC に届いた確認が取れていない間の
 // ES920_SETTINGS_REFRESH_MS ごと。PC は持っている設定値の番号を自己位置の行で知らせてくる（下の ES920_POSE_*）。
@@ -218,6 +242,9 @@ private const val LORA_BUTTONS_OFFSET = 4
 // 押した瞬間を落としたくないボタン（bit0〜14: 十字キー / ○△□× / L1 L2 R1 R2 / START SELECT PS）。
 // con.py の MOMENTARY_BUTTON_KEYS と同じもの。レーザー・t0・synced などの状態を表すビットは足さない。
 private const val LORA_MOMENTARY_MASK = 0x7FFF
+// パケットの通し番号（ボタン類の u32 の bit22-31）。MainActivity の packetSeq、con.py の PACKET_SEQ_SHIFT と同じ。
+private const val LORA_SEQ_SHIFT = 22
+private const val LORA_SEQ_MASK = 0x3FF
 
 /** パケットの 4〜7 バイト目のボタン類。 */
 private fun buttonsOf(packet: ByteArray): Int {
@@ -225,12 +252,20 @@ private fun buttonsOf(packet: ByteArray): Int {
     for (i in 0 until 4) v = v or ((packet[LORA_BUTTONS_OFFSET + i].toInt() and 0xFF) shl (8 * i))
     return v
 }
-private const val LORA_CHUNK_SIZE = 24
+private const val LORA_CHUNK_SIZE = 29
 private const val LORA_CHUNK_COUNT = 3
 private const val LORA_SETTINGS_SIZE = LORA_CHUNK_SIZE * LORA_CHUNK_COUNT
 private const val LORA_CONTROL_SIZE = LORA_HEAD_SIZE + 2
 private const val LORA_CHUNK_FRAME_SIZE = LORA_CONTROL_SIZE + LORA_CHUNK_SIZE
 private const val LORA_FULL_FRAME_SIZE = LORA_CONTROL_SIZE + LORA_SETTINGS_SIZE
+// 相手のバケツの位置（2026-11-08）。操作だけの 16 バイトの後ろに、MainActivity の enemyUpBytes()（8 バイト:
+// ENEMY_TAG / i16 x / i16 y / i16 z / 和）を付けた 24 バイトの行で送る。con.py の LORA_ENEMY_FRAME_SIZE / decode_enemy と合わせる。
+// 設定値を載せない回に、PC に届いたと分かるまでは ES920_ENEMY_RESEND_MS ごと、分かってからは ES920_ENEMY_CHECK_MS ごとに載せる。
+// 届いたかは、状態の行の 25〜31 バイト（PC が持っている値）で分かる（Wi-Fi が生きている間は UDP の返事で分かる）。
+private const val LORA_ENEMY_BLOCK_SIZE = 8
+private const val LORA_ENEMY_FRAME_SIZE = LORA_CONTROL_SIZE + LORA_ENEMY_BLOCK_SIZE
+private const val ES920_ENEMY_RESEND_MS = 300L
+private const val ES920_ENEMY_CHECK_MS = 5000L
 // 設定値が変わったら、続けて何回ぶん（分割なら 3 回で 1 回ぶん）送るか。1 回落としても届くように 2。
 private const val ES920_SETTINGS_ROUNDS_ON_CHANGE = 2
 // PC に届いた確認が取れていない間（Wi-Fi が生きていて自己位置を受け取らない間など）、設定値を送り直す間隔 [ms]。
@@ -243,11 +278,11 @@ private const val ES920_SETTINGS_CONFIRM_WARN_MS = 2000L
 // --- 無線で受け取る 1 回分（PC の con.py が、同期待ちのスマホへ設定値を送り返す）
 // UDP（ログ用ポート 5006）が届かず ES920LR だけでつながっているときの SYNC 用。con.py の LORA_SETTINGS_* と合わせる。
 // con.py は、こちらが送ってきた形（3 分割かどうか）に合わせて返してくる。
-// FSK: 次の 74 バイトを 1 回。
-//    0  1  LORA_SETTINGS_TAG / 1  1  map_id（PACKET_MAP_IDS の番号）/ 2  72  設定値
-// LoRa: 次の 27 バイトを 3 回。
-//    0  1  LORA_SETTINGS_TAG / 1  1  map_id / 2  1  何番目の 24 バイトか（0〜2）/ 3  24  設定値の 24×n〜
-// 設定値は送るパケットの 14〜85 バイトと同じ並び・倍率。
+// FSK: 次の 89 バイトを 1 回。
+//    0  1  LORA_SETTINGS_TAG / 1  1  map_id（PACKET_MAP_IDS の番号）/ 2  87  設定値
+// LoRa: 次の 32 バイトを 3 回。
+//    0  1  LORA_SETTINGS_TAG / 1  1  map_id / 2  1  何番目の 29 バイトか（0〜2）/ 3  29  設定値の 29×n〜
+// 設定値は送るパケットの 14〜100 バイトと同じ並び・倍率。
 // 受け取ったデータの先頭には RSSI と送り元の PAN ID・ID が付く（rssi 1 / rcvid 1 のため）。
 // その長さに頼らないよう、末尾を決まった長さ（下の受け取る種類の長さ）ごとに読んでみる。
 private const val LORA_SETTINGS_TAG: Byte = 0x53
@@ -260,9 +295,10 @@ private const val LORA_SETTINGS_CHUNK_SIZE = 3 + LORA_CHUNK_SIZE
 // （offset 14 の bit7）を付け、返事（OK）から最大 ES920_POSE_LISTEN_MS の間は送らずに受信する。
 // 状態の行が届いたら、そこで受信をやめてすぐ送信に戻る（操作の Hz をなるべく落とさないため）。
 // con.py は印を見たら、積んであるログの行を 1 つ（あれば）、続けて状態の行を送ってくる:
-//   状態の行（27 バイト）:
+//   状態の行（34 バイト）:
 //     0 u8 LORA_STATUS_TAG / 1 15 バイト 自己位置（UDP の自己位置と同じ並び）/ 16 8 バイト hojustate（ASCII、余りは 0）/
-//     24 u8 invalid_target の番号 / 25 u8 LORA_STATUS_TAG / 26 u8 1〜24 バイトの和の下位 8 bit
+//     24 u8 invalid_target の番号 / 25 7 バイト PC が持っている相手のバケツの位置（u8 has / i16 x / i16 y / i16 z。2026-11-08 追加）/
+//     32 u8 LORA_STATUS_TAG / 33 u8 1〜31 バイトの和の下位 8 bit
 //     自己位置の 13 / 14 バイト目に、PC が持っている設定値の状態が入る（設定値が届いたかの確認）:
 //       13: bit0 = 設定値を持っている / 14: その番号
 //   ログの行（/log の 1 行。4 + n バイト、n は 0〜LORA_LOG_MAX_BYTES）:
@@ -280,7 +316,8 @@ private const val LORA_LISTEN_FLAG = 0x80
 private const val LORA_STATUS_TAG: Byte = 0x50
 private const val LORA_POSE_SIZE = 15
 private const val LORA_HOJU_SIZE = 8
-private const val LORA_STATUS_FRAME_SIZE = 1 + LORA_POSE_SIZE + LORA_HOJU_SIZE + 3
+private const val LORA_ENEMY_ECHO_SIZE = 7
+private const val LORA_STATUS_FRAME_SIZE = 1 + LORA_POSE_SIZE + LORA_HOJU_SIZE + 1 + LORA_ENEMY_ECHO_SIZE + 2
 private const val LORA_LOG_TAG: Byte = 0x4C
 private const val LORA_LOG_MAX_BYTES = 45
 // PC の行がこの時間届かなければ、ログの番号を忘れる（番号は 256 で一周するので、長く途切れたあとに取りこぼさないため）[ms]
@@ -319,15 +356,224 @@ private val RESET_ORDER = listOf(RESET_HOLD_HIGH, RESET_RTS_PULSE, RESET_NEWLINE
 private class Es920LinkException(message: String) : Exception(message)
 
 /**
- * ES920LR を開いて設定し、offer() で渡された最新のパケットを決まった周期で送る。
+ * ES920LR の 2 組（A / B、ES920_LINK_COUNT）をまとめて動かす。MainActivity はこれだけを持つ。
+ * 2 組で分け合うもの（USB のモジュール、USB の許可、短い押し、受信の時間の順番、ログの行の番号）はここに置く。コールバックは組ごとの Es920Link にそのまま渡す。
+ * onScan / onStats は、どの組のものか（0 = A、1 = B）を最初の引数で渡す。
+ */
+class Es920Group(
+    private val context: Context,
+    private val log: (String) -> Unit,
+    onSettings: (Int, ByteArray) -> Unit,
+    waitingSettings: () -> Boolean,
+    wifiAlive: () -> Boolean,
+    airtimeTest: Boolean = false,
+    onStatus: (ByteArray, String, Int) -> Unit = { _, _, _ -> },
+    onLog: (String) -> Unit = {},
+    // 状態の行で、PC が持っている相手のバケツの位置が届いたら呼ぶ（x, y, z。持っていなければ null）。IO スレッドから呼ぶ。
+    onEnemyEcho: (IntArray?) -> Unit = {},
+    // 組ごとの起動するチャンネル（画面で選んで保存してあるもの）
+    initialChannels: List<Int> = ES920_DEFAULT_CHANNELS,
+    onScan: (Int, List<Es920ChannelScan>, Int) -> Unit = { _, _, _ -> },
+    onStats: (Int, Es920Stats) -> Unit = { _, _ -> },
+    // USB の許可ダイアログを出す前に呼ぶ。画面ピン留め中はダイアログが出ないので、MainActivity はここでピン留めを外し、
+    // 外し終えてから show() を呼ぶ（呼ばないとダイアログは出ない）。既定はすぐ出す。IO スレッドから呼ぶ。
+    private val beforePermissionDialog: (show: () -> Unit) -> Unit = { it() },
+    // 許可ダイアログの結果が来たら呼ぶ（MainActivity はピン留めし直す）。メインスレッドから呼ぶ。
+    private val afterPermissionDialog: () -> Unit = {}
+) {
+    internal val usbManager: UsbManager = context.getSystemService(UsbManager::class.java)
+
+    val links: List<Es920Link> = List(ES920_LINK_COUNT) { i ->
+        Es920Link(
+            group = this, index = i, log = log, onSettings = onSettings, waitingSettings = waitingSettings,
+            wifiAlive = wifiAlive, airtimeTest = airtimeTest, onStatus = onStatus, onLog = onLog,
+            onEnemyEcho = onEnemyEcho,
+            initialChannel = initialChannels.getOrElse(i) { ES920_DEFAULT_CHANNELS[i] },
+            onScan = { results, ch -> onScan(i, results, ch) },
+            onStats = { stats -> onStats(i, stats) }
+        )
+    }
+
+    // 相手のバケツの位置の上りの 8 バイト（null は送らない）と、PC に届いたと分かっているか。MainActivity が setEnemy で入れる
+    @Volatile
+    internal var enemyBlock: ByteArray? = null
+        private set
+    @Volatile
+    internal var enemyConfirmed = false
+        private set
+
+    /** 相手のバケツの位置（上りの 8 バイト）と、PC に届いたと分かっているかを渡す。どの組も設定値を載せない回に載せる。 */
+    fun setEnemy(block: ByteArray, confirmed: Boolean) {
+        enemyBlock = block
+        enemyConfirmed = confirmed
+    }
+
+    /** 使えるチャンネル。 */
+    val channels: IntRange get() = ES920_PROFILE.channels
+    /** 無線の方式の名前（画面の表示用）。 */
+    val profileName: String get() = ES920_PROFILE.name
+    /** チャンネルの中心周波数 [MHz]。 */
+    fun freqMhz(ch: Int): Double = ES920_PROFILE.freqBaseMhz + ES920_PROFILE.freqStepMhz * (ch - 1)
+
+    fun start(scope: CoroutineScope) {
+        ContextCompat.registerReceiver(
+            context, permissionReceiver, IntentFilter(ES920_PERMISSION_ACTION),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        links.forEach { it.start(scope) }
+    }
+
+    fun close() {
+        links.forEach { it.close() }
+        try { context.unregisterReceiver(permissionReceiver) } catch (_: Exception) {}
+    }
+
+    /** 送りたいパケット（send() で作った 92 バイト）と、その synced を両方の組に渡す。待たない。 */
+    fun offer(packet: ByteArray, synced: Boolean) {
+        // 送る間に来たパケットは捨てるので、そこで押されていたボタンは次に送るパケットに足す（pressedFor）。
+        pressedSinceSend.getAndUpdate { it or (buttonsOf(packet) and LORA_MOMENTARY_MASK) }
+        links.forEach { it.offer(packet, synced) }
+    }
+
+    // --- USB のモジュール。2 組が同じモジュールを開かないよう、開いているもの（deviceName）を覚える。
+
+    private val claimed = mutableSetOf<String>()
+
+    private fun es920Devices() = usbManager.deviceList.values.filter { it.vendorId == ES920_VENDOR_ID }
+
+    /** まだどの組も使っていないモジュールを 1 つ取る。無ければ null。 */
+    @Synchronized
+    internal fun claimDevice(): UsbDevice? =
+        es920Devices().sortedBy { it.deviceName }.firstOrNull { it.deviceName !in claimed }
+            ?.also { claimed += it.deviceName }
+
+    @Synchronized
+    internal fun releaseDevice(device: UsbDevice) {
+        claimed -= device.deviceName
+    }
+
+    /** まだどの組も使っていないモジュールが挿さっているか。 */
+    @Synchronized
+    internal fun hasFreeDevice(): Boolean = es920Devices().any { it.deviceName !in claimed }
+
+    // --- USB の許可。ダイアログは 1 つずつ出す。
+
+    /**
+     * USB の許可ダイアログを出している間は true。MainActivity の onPause はダイアログでも呼ばれるので、
+     * この間はアプリを終了しないようにする。
+     */
+    @Volatile
+    var permissionPending = false
+        private set
+    // 許可を頼んだ時刻。ES920_PERMISSION_TIMEOUT_MS たっても結果が来なければ（ダイアログが出なかったなど）頼み直す
+    @Volatile
+    private var permissionRequestedAtMs = 0L
+
+    private val permissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            permissionPending = false
+            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            log(if (granted) "LORA USB PERMISSION OK" else "LORA USB PERMISSION DENIED")
+            afterPermissionDialog()
+        }
+    }
+
+    // 許可の無いモジュールを最初に見つけた時刻（deviceName ごと）。ES920_AUTO_GRANT_WAIT_MS の間は頼まない
+    private val noPermissionSinceMs = mutableMapOf<String, Long>()
+
+    @Synchronized
+    internal fun requestPermission(device: UsbDevice) {
+        val now = System.currentTimeMillis()
+        // 挿した直後は Android の自動の許可（UsbAttachActivity の「常に」）を待つ。来なければダイアログで頼む
+        val since = noPermissionSinceMs.getOrPut(device.deviceName) { now }
+        if (now - since < ES920_AUTO_GRANT_WAIT_MS) return
+        if (permissionPending) {
+            if (now - permissionRequestedAtMs < ES920_PERMISSION_TIMEOUT_MS) return
+            log("LORA USB PERMISSION: no answer in ${ES920_PERMISSION_TIMEOUT_MS / 1000} s, asking again")
+        }
+        permissionPending = true
+        permissionRequestedAtMs = now
+        log("LORA USB PERMISSION REQUESTED (${device.deviceName})")
+        beforePermissionDialog {
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
+            val intent = Intent(ES920_PERMISSION_ACTION).setPackage(context.packageName)
+            usbManager.requestPermission(device, PendingIntent.getBroadcast(context, 0, intent, flags))
+        }
+    }
+
+    // --- 送るものの分け合い
+
+    /** どの組もまだ送っていないパケットで押されていたボタン（LORA_MOMENTARY_MASK のビット）。 */
+    private val pressedSinceSend = AtomicInteger(0)
+    // 短い押しを割り当てた最近のパケット（ボタン類の u32。通し番号入りなので、パケットごとに違う）と、割り当てた押し
+    private val pressedByKey = LinkedHashMap<Int, Int>()
+    private var lastPressedSeq = -1    // 最後に割り当てたパケットの通し番号（-1 はまだ無い）
+
+    /**
+     * このパケットに足す短い押し。前に送ったパケットより後に押して離したボタンを、次に送る新しいパケット（通し番号）に割り当てる。
+     * もう片方の組が同じパケットを送るときは、同じものを返す（同じ番号は 2 組とも同じ中身。con.py は片方だけを使う）。
+     * 別の番号に同じ押しを足すと、con.py には 2 回押したように見えることがあるので、割り当ては 1 つの番号にだけ。
+     * 割り当てたものより古い番号（もう片方の組が先に新しいものを送った）には足さない（con.py が捨てる番号に載せないため）。
+     */
+    @Synchronized
+    internal fun pressedFor(packet: ByteArray): Int {
+        val key = buttonsOf(packet)
+        pressedByKey[key]?.let { return it }
+        val seq = (key ushr LORA_SEQ_SHIFT) and LORA_SEQ_MASK
+        // 通し番号は 1024 で一周する。差が 1〜511 なら新しい（con.py の PacketSeq と同じ見方）
+        val diff = (seq - lastPressedSeq) and LORA_SEQ_MASK
+        if (lastPressedSeq >= 0 && diff !in 1..LORA_SEQ_MASK / 2) return 0
+        lastPressedSeq = seq
+        val bits = pressedSinceSend.getAndSet(0)
+        pressedByKey[key] = bits
+        while (pressedByKey.size > 8) pressedByKey.remove(pressedByKey.keys.first())
+        return bits
+    }
+
+    /**
+     * 受信の印を付けた回（このあと PC の行を受信する）は、2 組で交互にとる。PC が送る行の数を 1 組のときと同じにし、
+     * それぞれの組の操作が途切れる時間を半分にする。前の印から interval たっていれば true（その組が今回とる）。
+     */
+    private var lastListenMs = 0L
+
+    @Synchronized
+    internal fun takeListenWindow(now: Long, interval: Long): Boolean {
+        if (now - lastListenMs < interval) return false
+        lastListenMs = now
+        return true
+    }
+
+    /**
+     * PC のログの行は、どちらの組で届いても同じ番号なので、まとめて同じ行を捨てる。初めての行なら true。
+     * PC の行がしばらく届かなければ番号を忘れる（番号は 256 で一周するので、長く途切れたあとに取りこぼさないため）。
+     */
+    private val recentLogSeqs = ArrayDeque<Int>()
+    private var lastLogAtMs = 0L
+
+    @Synchronized
+    internal fun acceptLog(seq: Int, now: Long): Boolean {
+        if (now - lastLogAtMs > LORA_LOG_SEQ_RESET_MS) recentLogSeqs.clear()
+        lastLogAtMs = now
+        if (seq in recentLogSeqs) return false
+        recentLogSeqs.addLast(seq)
+        while (recentLogSeqs.size > 4) recentLogSeqs.removeFirst()
+        return true
+    }
+}
+
+/**
+ * ES920LR の 1 組（スマホ側の 1 台）。Es920Group が作る。
+ * 開いて設定し、offer() で渡された最新のパケットを決まった周期で送る。
  * 1 周期に 1 回、その時点の最新のパケットを送り、残りの時間は受信にあてる（周期は ES920_PROFILE.period*）。
  * 間に来たパケットは捨てる（古い操作を後から送らない）。
  * USB が抜けたりモジュールが返事をしなくなったら、ES920_RETRY_INTERVAL_MS ごとに開き直す。
  */
-class Es920Link(
-    private val context: Context,
+class Es920Link internal constructor(
+    private val group: Es920Group,
+    /** 組の番号（0 = A、1 = B）。 */
+    val index: Int,
     private val log: (String) -> Unit,
-    // 設定値が届いたら呼ぶ（map_id の番号, 72 バイト）。IO スレッドから呼ぶ。
+    // 設定値が届いたら呼ぶ（map_id の番号, 87 バイト）。IO スレッドから呼ぶ。
     private val onSettings: (Int, ByteArray) -> Unit,
     // true の間は SYNC 待ち（PC からの設定値を待っている）。IO スレッドから呼ぶ。
     private val waitingSettings: () -> Boolean,
@@ -340,19 +586,19 @@ class Es920Link(
     private val onStatus: (ByteArray, String, Int) -> Unit = { _, _, _ -> },
     // ES920LR でログの行（/log の 1 行）が届いたら呼ぶ。同じ行は 1 回だけ。IO スレッドから呼ぶ。
     private val onLog: (String) -> Unit = {},
+    // 状態の行で PC が持っている相手のバケツの位置が届いたら呼ぶ（持っていなければ null）。IO スレッドから呼ぶ。
+    private val onEnemyEcho: (IntArray?) -> Unit = {},
     // 起動するチャンネル（画面で選んで保存してあるもの）。
-    initialChannel: Int = ES920_DEFAULT_CHANNEL,
+    initialChannel: Int,
     // スキャンの途中と終わりに呼ぶ（それまでの結果, 今試しているチャンネル。終わったら 0）。IO スレッドから呼ぶ。
     private val onScan: (List<Es920ChannelScan>, Int) -> Unit = { _, _ -> },
     // 5 秒ごとの統計。IO スレッドから呼ぶ。
     private val onStats: (Es920Stats) -> Unit = {}
 ) {
-    /** 使えるチャンネル。 */
-    val channels: IntRange get() = ES920_PROFILE.channels
-    /** 無線の方式の名前（画面の表示用）。 */
-    val profileName: String get() = ES920_PROFILE.name
-    /** チャンネルの中心周波数 [MHz]。 */
-    fun freqMhz(ch: Int): Double = ES920_PROFILE.freqBaseMhz + ES920_PROFILE.freqStepMhz * (ch - 1)
+    /** 組の名前（"A" / "B"）。 */
+    val name: String get() = ES920_LINK_NAMES[index]
+    /** ログの頭（"LORA A" など）。 */
+    private val tag = "LORA ${ES920_LINK_NAMES[index]}"
 
     /** モジュールに設定してあるチャンネル（切り替えが終わったら変わる）。 */
     @Volatile
@@ -406,9 +652,8 @@ class Es920Link(
     var lastPcRxMs = 0L
         private set
     private var statusLines = 0     // 受け取った状態の行の数（受信を早めに切り上げるため）
-    private var lastLogSeq = -1     // 最後に受け取ったログの番号（-1 はまだ無い）
 
-    /** offer() で渡すもの。packet は send() で作った 86 バイト、synced はそのパケットの synced。 */
+    /** offer() で渡すもの。packet は send() で作った 92 バイト、synced はそのパケットの synced。 */
     private class TxPacket(val packet: ByteArray, val synced: Boolean)
 
     /** 受け取ったもの（readEvent）。 */
@@ -433,7 +678,7 @@ class Es920Link(
     /** 試験モード: モジュールを起動してから OK が返った送信の空中時間の合計 [µs]（見積もり）。 */
     @Volatile
     private var testAirUs = 0L
-    private val usbManager = context.getSystemService(UsbManager::class.java)
+    private val usbManager get() = group.usbManager
     private val outbox = Channel<TxPacket>(Channel.CONFLATED)
     private var job: Job? = null
     private var port: UsbSerialPort? = null
@@ -451,7 +696,7 @@ class Es920Link(
     private var frameSinceMs = 0L
 
     // --- 送る設定値（encodeFrame）
-    private var txKey: ByteArray? = null                 // 設定値 72 バイト + map + synced。変わったら番号を進める
+    private var txKey: ByteArray? = null                 // 設定値 87 バイト + map + synced。変わったら番号を進める
     private var txGen = 0                                 // 設定値の番号（0〜255）
     private val txSettings = ByteArray(LORA_SETTINGS_SIZE) // 番号を進めたときに写し取った設定値
     private var txGenAtMs = 0L                            // 番号を進めた時刻
@@ -464,62 +709,42 @@ class Es920Link(
     private var warnedGen = -1                            // 届かない警告を出した番号（1 回だけ出す）
     private var settingsFrames = 0                        // 統計の間に設定値を載せて送った回数
 
+    // 最後に相手のバケツの位置を載せて送った時刻
+    private var lastEnemyAtMs = 0L
+
     private val rxSettings = ByteArray(LORA_SETTINGS_SIZE)
     private val rxSettingsSeen = mutableSetOf<Int>()
     private var rxSettingsMap = -1
     private var rxSettingsLines = 0
-    private var lastPoseWindowMs = 0L
 
-    /**
-     * USB の許可ダイアログを出している間は true。MainActivity の onPause はダイアログでも呼ばれるので、
-     * この間はアプリを終了しないようにする。
-     */
-    @Volatile
-    var permissionPending = false
-        private set
-
-    private val permissionReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            permissionPending = false
-            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-            log(if (granted) "LORA USB PERMISSION OK" else "LORA USB PERMISSION DENIED")
-        }
-    }
-
-    /** 送りたいパケット（send() で作った 86 バイト）と、その synced を渡す。待たない。 */
-    fun offer(packet: ByteArray, synced: Boolean) {
-        // 送る間に来たパケットは捨てるので、そこで押されていたボタンは次に送る 1 回分に足す（encodeFrame）。
-        pressedSinceSend.getAndUpdate { it or (buttonsOf(packet) and LORA_MOMENTARY_MASK) }
+    /** 送りたいパケット（send() で作った 92 バイト）と、その synced を渡す。待たない（Es920Group.offer から呼ぶ）。 */
+    internal fun offer(packet: ByteArray, synced: Boolean) {
         outbox.trySend(TxPacket(packet, synced))
     }
 
-    // 前に送ってから offer() で渡されたパケットで押されていたボタン（LORA_MOMENTARY_MASK のビット）。
-    private val pressedSinceSend = AtomicInteger(0)
-
-    fun start(scope: CoroutineScope) {
-        ContextCompat.registerReceiver(
-            context, permissionReceiver, IntentFilter(ES920_PERMISSION_ACTION),
-            ContextCompat.RECEIVER_NOT_EXPORTED
-        )
+    internal fun start(scope: CoroutineScope) {
         job = scope.launch(Dispatchers.IO) {
             var lastError: String? = null
             while (isActive) {
+                var device: UsbDevice? = null
                 try {
-                    val device = findDevice() ?: throw Es920LinkException("not connected")
+                    // もう片方の組が開いていないモジュールを取る
+                    device = group.claimDevice() ?: throw Es920LinkException("not connected")
                     state = Es920State.STARTING
                     if (!usbManager.hasPermission(device)) {
-                        requestPermission(device)
+                        group.requestPermission(device)
                         throw Es920LinkException("waiting USB permission")
                     }
                     open(device)
                     val ch = requestedChannel
                     val t = startModule(resetMethod, ch)
                     channel = ch
-                    log("LORA READY: ${ES920_PROFILE.name} ${if (ES920_BINARY) "BINARY" else "ASCII"} ch $ch " +
+                    log("$tag READY: ${ES920_PROFILE.name} ${if (ES920_BINARY) "BINARY" else "ASCII"} ch $ch " +
+                        "id ${es920OwnId(index)}->${es920DstId(index)} ${device.deviceName} " +
                         "(boot ${t.bootMs} ms, ready ${t.readyMs} ms, attempts ${t.attempts})")
                     if (lostAtMs > 0) {
                         // ふつうの開き直し（USB の閉じ直し + ES920_RETRY_INTERVAL_MS の待ち込み）で戻るまでの時間。
-                        log("LORA RECOVERED in ${System.currentTimeMillis() - lostAtMs} ms after link lost")
+                        log("$tag RECOVERED in ${System.currentTimeMillis() - lostAtMs} ms after link lost")
                         lostAtMs = 0L
                     }
                     lastError = null
@@ -532,40 +757,28 @@ class Es920Link(
                     val msg = "${e.javaClass.simpleName} ${e.message}"
                     if (airtimeTest && testAirUs > 0) {
                         // 上限の前後でモジュールが再起動・無応答になったかを見るため、そのときの合計も出す。
-                        log("LORA AIRTIME TEST: link lost at %.1f s (${e.message}). counter restarts after reopen".format(testAirUs / 1e6))
+                        log("$tag AIRTIME TEST: link lost at %.1f s (${e.message}). counter restarts after reopen".format(testAirUs / 1e6))
                     }
-                    if (msg != lastError) log("LORA ERROR: ${e.message ?: e.javaClass.simpleName}")
+                    if (msg != lastError) log("$tag ERROR: ${e.message ?: e.javaClass.simpleName}")
                     lastError = msg
                     // 一度つながってから切れたときだけ測る（挿さっていない間などは数えない）。
                     if (lostAtMs == 0L && port != null) lostAtMs = System.currentTimeMillis()
                 } finally {
                     closePort()
-                    state = if (findDevice() == null) Es920State.NO_DEVICE else Es920State.STARTING
+                    device?.let { group.releaseDevice(it) }
+                    state = if (group.hasFreeDevice()) Es920State.STARTING else Es920State.NO_DEVICE
                 }
                 delay(ES920_RETRY_INTERVAL_MS)
             }
         }
     }
 
-    fun close() {
+    internal fun close() {
         job?.cancel()
         closePort()
-        try { context.unregisterReceiver(permissionReceiver) } catch (_: Exception) {}
     }
 
     // ------------------------------------------------------------------ USB
-
-    private fun findDevice(): UsbDevice? =
-        usbManager.deviceList.values.firstOrNull { it.vendorId == ES920_VENDOR_ID }
-
-    private fun requestPermission(device: UsbDevice) {
-        if (permissionPending) return
-        permissionPending = true
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
-        val intent = Intent(ES920_PERMISSION_ACTION).setPackage(context.packageName)
-        usbManager.requestPermission(device, PendingIntent.getBroadcast(context, 0, intent, flags))
-        log("LORA USB PERMISSION REQUESTED")
-    }
 
     private fun open(device: UsbDevice) {
         val driver = UsbSerialProber(
@@ -609,17 +822,17 @@ class Es920Link(
      */
     private fun startModule(firstMethod: Int, ch: Int, quiet: Boolean = false): StartTiming {
         val p = port ?: throw Es920LinkException("port closed")
-        if (!quiet) log("LORA control lines: supported=${p.supportedControlLines} now=${p.controlLines}")
+        if (!quiet) log("$tag control lines: supported=${p.supportedControlLines} now=${p.controlLines}")
         // 起動メッセージが何も来ないときは、リセットのかけ方を変えて順に試す（RESET_*）。
         val order = listOf(firstMethod) + RESET_ORDER.filter { it != firstMethod }
-        var index = 0
+        var methodIndex = 0   // 今試しているリセットのかけ方（order の何番目か）。組の番号 index とは別
         var attempt = order[0]
         var tries = 0
         var end = 0L
         var resetAt = 0L
         fun reset() {
             tries++
-            attempt = order[index]
+            attempt = order[methodIndex]
             when (attempt) {
                 RESET_RTS_PULSE -> { p.rts = true; Thread.sleep(100); p.rts = false }
                 RESET_HOLD_HIGH -> { p.dtr = false; p.rts = false; Thread.sleep(100); p.dtr = true; p.rts = true }
@@ -633,12 +846,12 @@ class Es920Link(
         while (true) {
             val line = readLine(end - System.currentTimeMillis())
             if (line == null) {
-                log("LORA no boot message, attempt $attempt (rx=$rxBytes bytes, pending=${rxPreview()})")
-                if (++index >= order.size) throw Es920LinkException("no boot message (rx=$rxBytes bytes)")
+                log("$tag no boot message, attempt $attempt (rx=$rxBytes bytes, pending=${rxPreview()})")
+                if (++methodIndex >= order.size) throw Es920LinkException("no boot message (rx=$rxBytes bytes)")
                 reset()
                 continue
             }
-            if (!quiet) log("LORA boot: $line")
+            if (!quiet) log("$tag boot: $line")
             if (line.trim() == ES920_BANNER_CONFIG) break
             if (ES920_BANNER_OPERATION in line) {
                 // 保存されている設定（format も）で動くので、BINARY かどうかがこちらの想定と違うかもしれない。
@@ -651,7 +864,7 @@ class Es920Link(
         val bootMs = System.currentTimeMillis() - resetAt
         resetMethod = attempt
         command("2")  // プロセッサモード
-        es920Commands(ch).forEach { command(it) }
+        es920Commands(ch, this.index).forEach { command(it) }
         command("start")
         // start のあとに続けて何か（改行など）が出ていても、BINARY の読み取りがずれないよう捨てる。
         Thread.sleep(50)
@@ -721,7 +934,7 @@ class Es920Link(
         var passedLaw = false
         var testDone = false
         if (airtimeTest) {
-            log("LORA AIRTIME TEST: period 0, stop at %.0f s".format(ES920_AIRTIME_TEST_STOP_US / 1e6))
+            log("$tag AIRTIME TEST: period 0, stop at %.0f s".format(ES920_AIRTIME_TEST_STOP_US / 1e6))
         }
         while (true) {
             // チャンネルの切り替えとスキャンは、送る合間にする。終わったら統計を測り直す。
@@ -741,22 +954,24 @@ class Es920Link(
             }
             // コントローラーの画面でない間は offer() が来ないので、ここで止まって送らない
             // （チャンネルの切り替え・スキャンを頼まれたら起きる）。
+            // もう片方の組が同じパケットを送っていても、待たずに送る（同じ番号を 2 組で重ねて送り、落ちにくくする）。
             val tx = select<TxPacket?> {
                 outbox.onReceive { it }
                 wake.onReceive { null }
             } ?: continue
             val cycleStart = System.currentTimeMillis()
             val cyclePeriod = if (airtimeTest) 0L else period()
-            // Wi-Fi が切れている間は、ときどき送ったあとに受信する時間をとる。SYNC 待ちは周期の残りで受信できるときは要らない。
-            val syncWindow = waitingSettings() && ES920_PROFILE.periodSyncMs == 0L
-            val poseWindow = !wifiAlive() && (syncWindow || !waitingSettings()) &&
-                cycleStart - lastPoseWindowMs >= (if (syncWindow) ES920_SYNC_LISTEN_INTERVAL_MS else ES920_POSE_INTERVAL_MS)
-            val frame = encodeFrame(tx, poseWindow, cycleStart)
-            if (frame.size > LORA_CONTROL_SIZE) settingsFrames++
-            val wireSize = if (ES920_BINARY) frame.size else (frame.size + 2) / 3 * 4
-            val air = ES920_PROFILE.airtimeBaseUs + ES920_PROFILE.airtimePerByteUs * wireSize
             // 試験モードで判定が出たあとは送らない。
             val hold = airtimeTest && testDone
+            // Wi-Fi が切れている間は、ときどき送ったあとに受信する時間をとる。SYNC 待ちは周期の残りで受信できるときは要らない。
+            // 受信の時間は 2 組で交互にとる（Es920Group.takeListenWindow）。
+            val syncWindow = waitingSettings() && ES920_PROFILE.periodSyncMs == 0L
+            val poseWindow = !hold && !wifiAlive() && (syncWindow || !waitingSettings()) &&
+                group.takeListenWindow(cycleStart, if (syncWindow) ES920_SYNC_LISTEN_INTERVAL_MS else ES920_POSE_INTERVAL_MS)
+            val frame = encodeFrame(tx, poseWindow, cycleStart)
+            if (frame.size > LORA_ENEMY_FRAME_SIZE) settingsFrames++
+            val wireSize = if (ES920_BINARY) frame.size else (frame.size + 2) / 3 * 4
+            val air = ES920_PROFILE.airtimeBaseUs + ES920_PROFILE.airtimePerByteUs * wireSize
             // 送信の返事が来た時刻（そこから listenMs 受信する）
             var replyAt = cycleStart
             if (hold) {
@@ -794,17 +1009,17 @@ class Es920Link(
                         timeouts = 0
                         // NG 102 は混んでいると 1 秒に何十回も来るので、1 回ずつは出さず 5 秒ごとの CS で数える。
                         if (airtimeTest) countTestNg(ngCodes, ngSeen, reply)
-                        else if (reply != ES920_REPLY_BUSY) log("LORA SEND $reply")
+                        else if (reply != ES920_REPLY_BUSY) log("$tag SEND $reply")
                     }
                 }
                 if (airtimeTest) {
                     if (!passedLaw && testAirUs >= ES920_AIRTIME_LAW_US) {
                         passedLaw = true
-                        log("LORA AIRTIME TEST: passed 360 s, module still answers OK")
+                        log("$tag AIRTIME TEST: passed 360 s, module still answers OK")
                     }
                     if (testAirUs >= ES920_AIRTIME_TEST_STOP_US) {
                         testDone = true
-                        log("LORA AIRTIME TEST RESULT: module did NOT limit (OK up to %.1f s). stopped sending".format(testAirUs / 1e6))
+                        log("$tag AIRTIME TEST RESULT: module did NOT limit (OK up to %.1f s). stopped sending".format(testAirUs / 1e6))
                     }
                 }
             }
@@ -815,7 +1030,6 @@ class Es920Link(
                 syncWindow -> ES920_SYNC_LISTEN_MS
                 else -> ES920_POSE_LISTEN_MS
             }
-            if (poseWindow && !hold) lastPoseWindowMs = cycleStart
             val listenEnd = if (hold) cycleStart + cyclePeriod else maxOf(cycleStart + cyclePeriod, replyAt + minListen)
             // 印を付けた回は、状態の行（PC が最後に送る）が届いたらすぐ送信に戻る。
             val statusBefore = statusLines
@@ -830,7 +1044,7 @@ class Es920Link(
                 now - txGenAtMs >= ES920_SETTINGS_CONFIRM_WARN_MS
             ) {
                 warnedGen = txGen
-                log("LORA SETTINGS NOT CONFIRMED: #$txGen for ${now - txGenAtMs} ms (PC has #$confirmedGen). resending")
+                log("$tag SETTINGS NOT CONFIRMED: #$txGen for ${now - txGenAtMs} ms (PC has #$confirmedGen). resending")
             }
             if (now - statsStart >= ES920_STATS_INTERVAL_MS) {
                 // ch: 今のチャンネル。Hz: OK が返った回数 / 秒
@@ -843,7 +1057,7 @@ class Es920Link(
                 // HOLD: 試験モードで送るのをやめたあとの周期の数
                 // REPLY: 書いてから返事が来るまでの平均 / 最大 [ms]
                 val stats = Es920Stats(channel, ok * 1000.0 / (now - statsStart), ok, busy, ng, noReply, now)
-                log("LORA ch%d %.1f Hz (CS %d/%d %.0f%%, NG %d, TO %d, RX %d, POSE %d, SET #%d %s x%d, HOLD %d, REPLY %.0f/%d ms)".format(
+                log("$tag ch%d %.1f Hz (CS %d/%d %.0f%%, NG %d, TO %d, RX %d, POSE %d, SET #%d %s x%d, HOLD %d, REPLY %.0f/%d ms)".format(
                     channel, stats.hz, busy, stats.attempts, stats.busyRate * 100, ng, noReply,
                     rxSettingsLines, rxPoseLines,
                     txGen, settingsStatus(), settingsFrames, held,
@@ -851,9 +1065,9 @@ class Es920Link(
                 onStats(stats)
                 if (airtimeTest) {
                     val codes = if (ngCodes.isEmpty()) "-" else ngCodes.entries.joinToString(" ") { "${it.key}x${it.value}" }
-                    log("LORA AIRTIME TEST: %.1f s since module start, NG: %s".format(testAirUs / 1e6, codes))
+                    log("$tag AIRTIME TEST: %.1f s since module start, NG: %s".format(testAirUs / 1e6, codes))
                     if (passedLaw && !testDone && ok == 0 && ng + busy + noReply > 0) {
-                        log("LORA AIRTIME TEST RESULT: module seems to LIMIT (no OK for %.0f s after %.1f s)".format(
+                        log("$tag AIRTIME TEST RESULT: module seems to LIMIT (no OK for %.0f s after %.1f s)".format(
                             (now - statsStart) / 1e3, testAirUs / 1e6))
                     }
                     ngCodes.clear()
@@ -901,7 +1115,7 @@ class Es920Link(
         }
         startModule(resetMethod, to, quiet = true)
         channel = to
-        log("LORA CH $from -> $to: told PC $sentOk/$ES920_HINT_OK (busy $busy), ${System.currentTimeMillis() - t0} ms")
+        log("$tag CH $from -> $to: told PC $sentOk/$ES920_HINT_OK (busy $busy), ${System.currentTimeMillis() - t0} ms")
     }
 
     /**
@@ -914,7 +1128,7 @@ class Es920Link(
         val t0 = System.currentTimeMillis()
         val results = mutableListOf<Es920ChannelScan>()
         scanning = true
-        log("LORA SCAN start: ch ${ES920_PROFILE.channels.first}-${ES920_PROFILE.channels.last}, $ES920_SCAN_PROBES tries each")
+        log("$tag SCAN start: ch ${ES920_PROFILE.channels.first}-${ES920_PROFILE.channels.last}, $ES920_SCAN_PROBES tries each")
         try {
             for (ch in ES920_PROFILE.channels) {
                 if (scanCancel) break
@@ -945,7 +1159,7 @@ class Es920Link(
         }
         // 開き直しになったとき（上の例外）は、start() のループが requestedChannel で設定し直す。
         startModule(resetMethod, home, quiet = true)
-        log("LORA SCAN done in %.1f s%s: %s".format(
+        log("$tag SCAN done in %.1f s%s: %s".format(
             (System.currentTimeMillis() - t0) / 1e3, if (scanCancel) " (canceled)" else "",
             results.joinToString(" ") { "${it.channel}:${(it.busyRate * 100).toInt()}%" }))
     }
@@ -953,7 +1167,7 @@ class Es920Link(
     /** 試験モード: NG の種類を数え、初めて来た種類はそのときの合計と一緒にログに出す。 */
     private fun countTestNg(codes: MutableMap<String, Int>, seen: MutableSet<String>, code: String) {
         codes[code] = (codes[code] ?: 0) + 1
-        if (seen.add(code)) log("LORA AIRTIME TEST: first $code at %.1f s".format(testAirUs / 1e6))
+        if (seen.add(code)) log("$tag AIRTIME TEST: first $code at %.1f s".format(testAirUs / 1e6))
     }
 
     /** 送信の返事を待つ。OK / "NG xxx" を返し、時間切れなら null。間に来た受信データは onReceived に渡す。 */
@@ -1016,7 +1230,7 @@ class Es920Link(
     private fun onReceived(ev: RxEvent.Data) {
         val now = System.currentTimeMillis()
         tail(ev, LORA_STATUS_FRAME_SIZE)?.let { frame ->
-            val body = LORA_POSE_SIZE + LORA_HOJU_SIZE + 1
+            val body = LORA_POSE_SIZE + LORA_HOJU_SIZE + 1 + LORA_ENEMY_ECHO_SIZE
             if (frame[0] == LORA_STATUS_TAG && frame[1 + body] == LORA_STATUS_TAG &&
                 (frame[2 + body].toInt() and 0xFF) == sum8(frame, 1, body)
             ) {
@@ -1026,20 +1240,23 @@ class Es920Link(
                 val pose = frame.copyOfRange(1, 1 + LORA_POSE_SIZE)
                 onSettingsState(hasSettings = (pose[13].toInt() and 1) != 0, pcGen = pose[14].toInt() and 0xFF)
                 val hoju = String(frame, 1 + LORA_POSE_SIZE, LORA_HOJU_SIZE, Charsets.US_ASCII).trimEnd('\u0000')
-                onStatus(pose, hoju, frame[body].toInt() and 0xFF)
+                val invalidAt = 1 + LORA_POSE_SIZE + LORA_HOJU_SIZE
+                onStatus(pose, hoju, frame[invalidAt].toInt() and 0xFF)
+                // PC が持っている相手のバケツの位置（u8 has / i16 x / i16 y / i16 z）
+                val echo = java.nio.ByteBuffer.wrap(frame, invalidAt + 1, LORA_ENEMY_ECHO_SIZE).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                val has = echo.get().toInt() != 0
+                val xyz = intArrayOf(echo.short.toInt(), echo.short.toInt(), echo.short.toInt())
+                onEnemyEcho(if (has) xyz else null)
                 return
             }
         }
         parseLogFrame(ev)?.let { (seq, text) ->
-            if (now - lastPcRxMs > LORA_LOG_SEQ_RESET_MS) lastLogSeq = -1
             lastPcRxMs = now
-            if (seq != lastLogSeq) {
-                lastLogSeq = seq
-                onLog(text)
-            }
+            // 同じ行は PC が何回かに分けて送り直し、どちらの組でも届くので、2 組まとめて 1 回だけ出す
+            if (group.acceptLog(seq, now)) onLog(text)
             return
         }
-        // FSK の設定値（74 バイト、1 回）
+        // FSK の設定値（89 バイト、1 回）
         tail(ev, LORA_SETTINGS_FULL_SIZE)?.let { frame ->
             if (frame[0] == LORA_SETTINGS_TAG) {
                 rxSettingsLines++
@@ -1048,7 +1265,7 @@ class Es920Link(
                 return
             }
         }
-        // LoRa の設定値の 3 回のうちの 1 回（27 バイト）
+        // LoRa の設定値の 3 回のうちの 1 回（32 バイト）
         val frame = tail(ev, LORA_SETTINGS_CHUNK_SIZE) ?: return
         if (frame[0] != LORA_SETTINGS_TAG) return
         val map = frame[1].toInt() and 0xFF
@@ -1073,7 +1290,7 @@ class Es920Link(
     private fun onSettingsState(hasSettings: Boolean, pcGen: Int) {
         val now = System.currentTimeMillis()
         if (hasSettings && pcGen == txGen) {
-            if (confirmedGen != txGen) log("LORA SETTINGS CONFIRMED: #$txGen reached PC in ${now - txGenAtMs} ms")
+            if (confirmedGen != txGen) log("$tag SETTINGS CONFIRMED: #$txGen reached PC in ${now - txGenAtMs} ms")
             confirmedGen = txGen
             confirmedAtMs = now
         } else {
@@ -1083,7 +1300,7 @@ class Es920Link(
         }
     }
 
-    /** 86 バイトのパケットを、無線で送る 1 回分にする（並びはファイル先頭の LORA_* のコメント）。 */
+    /** 101 バイトのパケットを、無線で送る 1 回分にする（並びはファイル先頭の LORA_* のコメント）。 */
     private fun encodeFrame(tx: TxPacket, listen: Boolean, now: Long): ByteArray {
         val packet = tx.packet
         // 設定値・マップ・synced のどれかが変わったら、番号を進めて写し取り、送り始める。
@@ -1104,22 +1321,32 @@ class Es920Link(
         }
         val info = if (listen) LORA_LISTEN_FLAG else 0
         val withSettings = pendingRounds > 0 || nextChunk != 0
+        // 設定値を載せない回に、相手のバケツの位置をときどき載せる（PC に届いたと分かるまでは短い間隔で）
+        val enemy = group.enemyBlock
+        val withEnemy = !withSettings && enemy != null &&
+            now - lastEnemyAtMs >= (if (group.enemyConfirmed) ES920_ENEMY_CHECK_MS else ES920_ENEMY_RESEND_MS)
         val size = when {
+            withEnemy -> LORA_ENEMY_FRAME_SIZE
             !withSettings -> LORA_CONTROL_SIZE
             ES920_PROFILE.chunked -> LORA_CHUNK_FRAME_SIZE
             else -> LORA_FULL_FRAME_SIZE
         }
         val frame = ByteArray(size)
         packet.copyInto(frame, 0, 0, LORA_HEAD_SIZE)
-        // 前に送ってから押して離したボタンも、この 1 回にだけ押したことにして載せる（短い押しを落とさないため）。
-        // 続けて載せることはしないので、この 1 回が電波で落ちたらその押しは届かない。
+        // 前に送ってから押して離したボタンも、このパケット（通し番号）にだけ押したことにして載せる（短い押しを落とさないため）。
+        // もう片方の組が同じ番号を送れば、そちらにも同じく載る。続く番号には載せないので、その番号が 2 組とも落ちたら届かない。
         // Wi-Fi が生きている間は載せない。その押しは UDP で届いているので、con.py がこの 1 回を使うと二重に押したことになる。
-        val pressed = pressedSinceSend.getAndSet(0)
+        val pressed = group.pressedFor(packet)
         val buttons = buttonsOf(packet) or (if (wifiAlive()) 0 else pressed)
         for (i in 0 until 4) frame[LORA_BUTTONS_OFFSET + i] = (buttons ushr (8 * i)).toByte()
         frame[LORA_HEAD_SIZE + 1] = txGen.toByte()
         when (size) {
             LORA_CONTROL_SIZE -> frame[LORA_HEAD_SIZE] = info.toByte()
+            LORA_ENEMY_FRAME_SIZE -> {
+                frame[LORA_HEAD_SIZE] = info.toByte()
+                enemy!!.copyInto(frame, LORA_CONTROL_SIZE, 0, LORA_ENEMY_BLOCK_SIZE)
+                lastEnemyAtMs = now
+            }
             LORA_FULL_FRAME_SIZE -> {
                 frame[LORA_HEAD_SIZE] = info.toByte()
                 txSettings.copyInto(frame, LORA_CONTROL_SIZE)

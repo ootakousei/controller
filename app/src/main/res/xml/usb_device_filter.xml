@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- ES920LR の USB-シリアル (CH340, vendor 0x1a86 = 6790)。挿すとこのアプリに自動で許可が出る -->
+<!-- ES920LR の USB-シリアル (CH340, vendor 0x1a86 = 6790)。UsbAttachActivity が受ける。
+     初めて挿したときの「Controller で開く」で「常に」にチェックすると、次からは挿すだけでこのアプリに許可が出る -->
 <resources>
     <usb-device vendor-id="6790" />
 </resources>

@@ -48,6 +48,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -97,6 +98,21 @@ private const val BAKETU_SPEED_MIN = 4.0f
 private const val BAKETU_SPEED_MAX = 5.0f
 private const val HATA_SPEED_MIN = 9.0f
 private const val HATA_SPEED_MAX = 10.5f
+// HOJU（移動先 HOJU で撃つとき）の射出速度の範囲。mast2 の input.cpp の HOJU_VEL_MIN / MAX と合わせる。
+private const val HOJU_SPEED_MIN = 4.0f
+private const val HOJU_SPEED_MAX = 10.0f
+// HOJU の射出速度の保存値が無いときの値（con.py の SETTING_DEFAULTS と同じ）。
+private const val HOJU_DEFAULT_SPEED = 5.5f
+// 移動バケツ（idoubake）を狙うときの射出速度の差（2026-11-08 追加）の範囲。移動バケツ中、ロボット（mast2 の input_node）は
+// □△○ の速度を「drive2 が起動時に計算した速度 + これ」にする（hoju の速度には足さない）。
+// 保存値が無ければ 0（con.py の SETTING_DEFAULTS と同じ）。刻みは射出速度と同じ speedStep。
+private const val IDOUBAKE_SPEED_DIF_MIN = -4.0f
+private const val IDOUBAKE_SPEED_DIF_MAX = 4.0f
+// retry ボタンを押してから true を送り続ける時間 [s]。
+private const val RETRY_HOLD_SECONDS = 15
+// 移動バケツ（idoubake）を解除する前後のスティックの大きさ。drive2 の hoju_line_deadzone と合わせる（2026-11-08）。
+// 比べるのは PC へ送る値（vx。lowGain なら半分）で、PC の controller_val.y と同じもの。
+private const val HOJU_LINE_DEADZONE = 0.05f
 
 // SPEED ADJUST の +/- を押しっぱなしにしたときの連続調整の間隔。HATA の turn 調整と同じ値。
 private const val SPEED_REPEAT_INITIAL_DELAY_MS = 160L
@@ -141,10 +157,12 @@ private class SendPath(val name: String, val network: Network, val socket: Datag
     }
 }
 
-// ロボットへ送るバイナリパケット（リトルエンディアン、86 byte）。並びは send() を参照。
+// ロボットへ送るバイナリパケット（リトルエンディアン、101 byte）。並びは send() を参照。
 // con.py の decode_packet() と必ず合わせること。
-private const val PACKET_VERSION: Byte = 15
-private const val PACKET_SIZE = 86
+// 2026-11-08 に version 18。idoubake_speed_dif（i16）を 98 byte 目に足し、100 byte 目は空き（0）。
+// 設定値（14〜100 byte）を 87 byte にして、ES920LR の LoRa で 29 byte × 3 回に割り切れるようにするため。
+private const val PACKET_VERSION: Byte = 18
+private const val PACKET_SIZE = 101
 
 // float は「値 × 倍率」を四捨五入して int16 で送る（con.py の STICK_SCALE / SETTING_SCALES と合わせる）。
 // 整数で送るので、con.py 側で割り戻しても 0.30000001 のように桁が伸びない。
@@ -167,12 +185,15 @@ private val SETTING_SCALES = listOf(
     "hata_near_deka_speed1" to SPEED_SCALE, "hata_near_deka_speed2" to SPEED_SCALE, "hata_near_deka_speed3" to SPEED_SCALE,
     "hata_far_deka_speed1" to SPEED_SCALE, "hata_far_deka_speed2" to SPEED_SCALE, "hata_far_deka_speed3" to SPEED_SCALE,
     "hata_o_turnx" to TURN_XY_SCALE, "hata_o_turny" to TURN_XY_SCALE, "hata_o_turntheta" to TURN_THETA_SCALE,
+    "hoju_speed1" to SPEED_SCALE, "hoju_speed2" to SPEED_SCALE, "hoju_speed3" to SPEED_SCALE,
+    "idoubake_turnx" to TURN_XY_SCALE, "idoubake_turny" to TURN_XY_SCALE, "idoubake_turntheta" to TURN_THETA_SCALE,
+    "idoubake_speed_dif" to SPEED_SCALE,
 )
 
 // 文字列の id は、この並びの番号（u8）で送る。並びにない id は 0xFF。
 private val PACKET_MAP_IDS = listOf("redmap", "bluemap")
 // 撃つ速度の組まで送る（packetObject()）。
-private val PACKET_OBJECT_IDS = listOf("baketu_bs2", "baketu_bs3", "hata_near_hutuu", "hata_near_deka", "hata_far_hutuu", "hata_far_deka")
+private val PACKET_OBJECT_IDS = listOf("baketu_bs2", "baketu_bs3", "hata_near_hutuu", "hata_near_deka", "hata_far_hutuu", "hata_far_deka", "hoju")
 private val PACKET_TARGET_IDS = listOf(
     "", "none",
     // "hbo" / "hbt" は移動先から消したが、con.py と番号を合わせるため席だけ残している。
@@ -190,12 +211,39 @@ private val PACKET_TARGET_IDS = listOf(
 //    1      i32   x     × POSE_XY_SCALE（mm）
 //    5      i32   y     × POSE_XY_SCALE（mm）
 //    9      i32   theta × POSE_THETA_SCALE（rad）
-//   13      u8    bit0 = PC が ES920LR の行を受け取れている（画面の LoRa の生死。Wi-Fi が生きている間はこれで見る）
+//   13      u8    bit i = PC が ES920LR の組 i（bit0 = A、bit1 = B）の行を受け取れている
+//                 （画面の LoRa の生死。Wi-Fi が生きている間はこれで見る）
 //   14      u8    invalid_target の番号（ES920LR の状態の行の番号と比べ、Wi-Fi で処理済みの分を二重に扱わないため）
 private const val POSE_PACKET_VERSION: Byte = 2
 private const val POSE_PACKET_SIZE = 15
 private const val POSE_XY_SCALE = 100.0        // 0.01mm 刻み
 private const val POSE_THETA_SCALE = 10000.0   // 0.0001rad 刻み
+
+// 相手のバケツの位置（2026-11-08）。フィールド選択画面で選び、操作のパケットとは別の小さいパケットで送る。
+// con.py の ENEMY_* と必ず合わせる。値はゾーン基準の mm:
+//   原点は相手スタートゾーンの右下、x = 奥（前）へ、y = 左へ。y は青ではフェンスからの距離、赤ではその逆向き
+//   （ロボットの地図は赤で y が反転しているため）。z = バケツの底の床からの高さ（ロボットは z + 250 = 口を狙う）。
+//   2026-11-08 に移動バケツ位置決めの仕様（kazusa_notes/mag_pc/2026-11-08_idoubake_spec.md）に合わせた。
+//   ロボットは launch のときに 1 回だけ使う（con.py → launch_starter → drive2）。起動したあとに変えても次に起動し直すまで効かない。
+//   上り（8 バイト）: 0 u8 ENEMY_TAG / 1 i16 x / 3 i16 y / 5 i16 z / 7 u8 1〜6 バイトの和の下位 8 bit
+//     UDP ではこのまま 5005 番へ。ES920LR では操作だけの行の後ろに付ける（Es920Link.kt の LORA_ENEMY_*）。
+//   PC の返事（UDP、9 バイト）: 0 u8 ENEMY_TAG / 1 u8 has / 2 i16 x / 4 i16 y / 6 i16 z / 8 u8 1〜7 バイトの和の下位 8 bit
+//     ES920LR では状態の行に同じ値（has / x / y / z）が入る。
+//   PC が今持っている値が返ってくるので、自分の値と同じなら届いた（番号は使わない）。
+//   届くまで ENEMY_RESEND_MS ごとに送り直し続け、届いてからも ENEMY_CHECK_MS ごとに送って確かめる。
+private const val ENEMY_TAG: Byte = 0x45
+private const val ENEMY_UP_SIZE = 8
+private const val ENEMY_ACK_SIZE = 9
+private const val ENEMY_RESEND_MS = 300L
+private const val ENEMY_CHECK_MS = 5000L
+// +/- 1 回の量と範囲 [mm]（con.py の ENEMY_*_RANGE と同じ）
+private const val ENEMY_STEP = 50
+private val ENEMY_X_RANGE = 0..1000
+private val ENEMY_Y_RANGE = 0..1000
+private val ENEMY_Z_RANGE = 0..1800   // 2026-11-08 に 2000 -> 1800（ロボットの drive2 が受け付ける範囲）
+private const val ENEMY_DEFAULT_X = 500
+private const val ENEMY_DEFAULT_Y = 500
+private const val ENEMY_DEFAULT_Z = 1200
 
 private fun packetIndex(ids: List<String>, id: String): Byte =
     ids.indexOf(id).let { if (it < 0) 0xFF else it }.toByte()
@@ -215,6 +263,7 @@ private fun Float.roundToScale(scale: Float): Float = Math.round(this * scale) /
 /** OBJECT ごとの射出速度の可変範囲。 */
 private fun speedRangeFor(objectId: String): ClosedFloatingPointRange<Float> = when (objectId) {
     "hata" -> HATA_SPEED_MIN..HATA_SPEED_MAX
+    "hoju" -> HOJU_SPEED_MIN..HOJU_SPEED_MAX
     else -> BAKETU_SPEED_MIN..BAKETU_SPEED_MAX
 }
 
@@ -235,51 +284,94 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var lastPoseNanos = 0L
 
-    private val es920 by lazy {
-        Es920Link(
+    // ES920LR は 2 組（A / B）を別々のチャンネルで同時に使う（Es920Link.kt の ES920_LINK_COUNT）。
+    private val es920: Es920Group by lazy {
+        Es920Group(
             this, ::appendLog, ::applyLoraSettings,
             waitingSettings = { !settingsSynced },
             wifiAlive = { System.nanoTime() - lastPoseNanos < ES920_WIFI_TIMEOUT_MS * 1_000_000 },
             airtimeTest = ES920_AIRTIME_TEST,
             onStatus = ::applyLoraStatus,
             onLog = ::applyLoraLog,
-            initialChannel = prefs.getInt(PREF_ES920_CHANNEL, ES920_DEFAULT_CHANNEL),
-            onScan = { results, scanningCh ->
+            onEnemyEcho = { xyz -> enemyAck = xyz?.toList() },
+            initialChannels = List(ES920_LINK_COUNT) { i -> prefs.getInt(es920ChannelPref(i), ES920_DEFAULT_CHANNELS[i]) },
+            onScan = { link, results, scanningCh ->
                 runOnUiThread {
                     loraScan = results
                     loraScanningCh = scanningCh
+                    loraScanLink = link
                     if (scanningCh == 0) loraScanAtMs = System.currentTimeMillis()
                 }
             },
-            onStats = { stats -> runOnUiThread { loraStats = stats } }
+            onStats = { link, stats -> runOnUiThread { loraStats = loraStats.toMutableList().also { it[link] = stats } } },
+            // 画面ピン留め中は USB の許可ダイアログが出ないので、出す間だけピン留めを外す（USB_PIN_* の説明）
+            beforePermissionDialog = { show ->
+                runOnUiThread {
+                    repinJob?.cancel()
+                    if (isLockTaskActive()) stopLockTask()
+                    lifecycleScope.launch {
+                        delay(USB_UNPIN_SETTLE_MS)
+                        show()
+                    }
+                }
+            },
+            afterPermissionDialog = {
+                // コントローラーの画面でピン留めを外していたときだけ、ピン留めし直す（フィールド選択画面ではピン留めしない）。
+                // もう 1 台の許可が続くかもしれないので、少し待ってから
+                repinJob?.cancel()
+                repinJob = lifecycleScope.launch {
+                    delay(USB_REPIN_DELAY_MS)
+                    if (!es920.permissionPending && currentScreen == ScreenState.CONTROLLER) startLockTaskMode()
+                }
+            }
         )
     }
+    // USB の許可のあと、ピン留めし直すのを待っている処理
+    private var repinJob: Job? = null
 
-    // フィールド選択画面の LORA CHANNEL の表示。
-    // 選んだチャンネル（保存する。モジュールの切り替えが終わるまでは es920.channel と違う）
-    private var loraSelectedCh by mutableStateOf(ES920_DEFAULT_CHANNEL)
+    private fun isLockTaskActive(): Boolean =
+        (getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).lockTaskModeState != ActivityManager.LOCK_TASK_MODE_NONE
+
+    // フィールド選択画面の LORA CHANNEL の表示。リストは組ごと（0 = A、1 = B）。
+    // 選んだチャンネル（保存する。モジュールの切り替えが終わるまでは es920.links[i].channel と違う）
+    private var loraSelectedCh by mutableStateOf(ES920_DEFAULT_CHANNELS)
     // モジュールに設定してあるチャンネルと状態（LINK_REFRESH_MS ごとに写す）
-    private var loraActiveCh by mutableStateOf(ES920_DEFAULT_CHANNEL)
-    private var loraState by mutableStateOf(Es920State.NO_DEVICE)
-    // スキャンの結果と、今試しているチャンネル（0 はスキャンしていない）、終わった時刻（0 はまだ）
+    private var loraActiveCh by mutableStateOf(ES920_DEFAULT_CHANNELS)
+    private var loraState by mutableStateOf(List(ES920_LINK_COUNT) { Es920State.NO_DEVICE })
+    // パネルでチャンネルを選ぶ・スキャンする組
+    private var loraEditLink by mutableStateOf(0)
+    // スキャンの結果と、今試しているチャンネル（0 はスキャンしていない）、終わった時刻（0 はまだ）、スキャンした組。
+    // 混み具合はどちらの組で調べても同じなので、最後のスキャンの結果を 1 つだけ持つ。
     private var loraScan by mutableStateOf<List<Es920ChannelScan>>(emptyList())
     private var loraScanningCh by mutableStateOf(0)
     private var loraScanAtMs by mutableStateOf(0L)
+    private var loraScanLink by mutableStateOf(0)
     // 最後の 5 秒ごとの統計（コントローラーの画面で送っていた間のもの）
-    private var loraStats by mutableStateOf<Es920Stats?>(null)
+    private var loraStats by mutableStateOf(List<Es920Stats?>(ES920_LINK_COUNT) { null })
 
-    /** ES920LR のチャンネルを選ぶ。保存して、モジュールを切り替える（PC には今のチャンネルで知らせてから移る）。 */
+    /**
+     * パネルで選んでいる組の ES920LR のチャンネルを選ぶ。保存して、モジュールを切り替える（PC には今のチャンネルで知らせてから移る）。
+     * もう片方の組と同じチャンネルは選べない（お互いのキャリアセンスで送れなくなる）。
+     */
     private fun selectLoraChannel(ch: Int) {
         if (ch !in es920.channels) return
-        loraSelectedCh = ch
-        prefs.edit().putInt(PREF_ES920_CHANNEL, ch).apply()
-        es920.requestChannel(ch)
-        appendLog("LORA CH SELECT $ch")
+        val link = loraEditLink
+        val name = ES920_LINK_NAMES[link]
+        val other = loraSelectedCh.withIndex().firstOrNull { it.index != link && it.value == ch }
+        if (other != null) {
+            appendLog("LORA $name CH $ch: used by ${ES920_LINK_NAMES[other.index]}")
+            return
+        }
+        loraSelectedCh = loraSelectedCh.toMutableList().also { it[link] = ch }
+        prefs.edit().putInt(es920ChannelPref(link), ch).apply()
+        es920.links[link].requestChannel(ch)
+        appendLog("LORA $name CH SELECT $ch")
     }
 
     // UDP の自己位置の 13 バイト目: PC が ES920LR の行を受け取れているか（Wi-Fi が生きている間の LoRa の生死）。
+    // bit i が組 i（bit0 = A、bit1 = B）。
     @Volatile
-    private var pcHearsLora = false
+    private var pcHearsLora = 0
     // 最後に知った invalid_target の番号（-1 はまだ知らない）。UDP の自己位置で追いかけ、
     // ES920LR の状態の行で番号が進んでいたら MOVE TARGET を解除する（Wi-Fi のときはログの invalid_target で解除する）。
     @Volatile
@@ -287,8 +379,9 @@ class MainActivity : ComponentActivity() {
 
     // 画面の LINK の表示（LINK_REFRESH_MS ごとに作り直す）。
     private var linkWifiOk by mutableStateOf(false)
-    private var linkLoraText by mutableStateOf("LORA ---")
-    private var linkLoraOk by mutableStateOf(false)
+    // LoRa は組ごと（0 = A、1 = B）。
+    private var linkLoraText by mutableStateOf(ES920_LINK_NAMES.map { "LORA $it ---" })
+    private var linkLoraOk by mutableStateOf(List(ES920_LINK_COUNT) { false })
 
     // ?????????????????Job?Activity????????????????????
     private var networkJob: Job? = null
@@ -332,6 +425,37 @@ class MainActivity : ComponentActivity() {
     private var hoju_turnx by mutableStateOf(0.0f)
     private var hoju_turny by mutableStateOf(0.0f)
     private var hoju_turntheta by mutableStateOf(0.0f)
+    // 移動バケツ（idoubake）を狙うときの turn（2026-11-07 追加）。移動先は HOJU のまま。
+    // ロボットの drive2 が使うのは theta [deg] だけ（移動バケツ中の向き = 計算した向き + これ。2026-11-08）。x / y は使わない。
+    private var idoubake_turnx by mutableStateOf(0.0f)
+    private var idoubake_turny by mutableStateOf(0.0f)
+    private var idoubake_turntheta by mutableStateOf(0.0f)
+    // 移動バケツ中か。true の間、TURN ADJUST は hoju turn の代わりに idoubake turn を動かす。
+    // 2026-11-08 から、ロボットの drive2 と同じ規則で決める（drive2 は bit21 を見ず、SELECT と前後のスティックから自分で決める）:
+    //   入る: 移動先 HOJU を選んでいる間に SELECT を押した（前後のスティックを倒していないときだけ。パスの途中でもよい。
+    //         drive2 はパスの途中なら覚えておき、hoju に着いたら移動バケツにする）。もう一度押しても何もしない
+    //   出る: 前後のスティックを倒した（onGenericMotionEvent）、移動先を選び直した / 解除した（applyMoveTarget / clearMoveTarget）、
+    //         ロボットの invalid_target（clearMoveTarget）
+    // 移動先（place）を増やすのではない。con.py へはボタン類の bit21 で送る（PC は使わない）。
+    private var hojuIdoubake by mutableStateOf(false)
+    // 移動バケツを狙うときの射出速度の差（2026-11-08 追加）。SPEED ADJUST の HOJU の DIF の行で動かす。
+    // con.py へは設定値として送り、保存もする（ほかの turn / speed と同じ）。移動バケツ中の射出速度に足される。
+    private var idoubakeSpeedDif by mutableStateOf(0.0f)
+
+    // 相手のバケツの位置 [mm]（ENEMY_* の説明）。フィールド選択画面の +/- で選ぶ。スマホの中に保存して持つ（loadEnemy / changeEnemy）。
+    // PC と同期していなくても（届いていなくても、PC が別の値を持っていても）この値を使い続け、PC の値で上書きしない。
+    // PC から返ってくる値（enemyAck）は、届いたかを比べるのにだけ使う。
+    private var enemyX by mutableStateOf(ENEMY_DEFAULT_X)
+    private var enemyY by mutableStateOf(ENEMY_DEFAULT_Y)
+    private var enemyZ by mutableStateOf(ENEMY_DEFAULT_Z)
+    // PC が持っていると返してきた値（UDP の返事か ES920LR の状態の行）。null は PC が持っていない / まだ返事が無い。
+    private var enemyAck by mutableStateOf<List<Int>?>(null)
+    // PC に今の値が届いているか
+    private val enemyConfirmed: Boolean
+        get() = enemyAck == listOf(enemyX, enemyY, enemyZ)
+    // 最後に UDP で送った時刻（SystemClock.elapsedRealtime）。値を変えたら 0 にしてすぐ送る
+    @Volatile
+    private var enemyLastSentMs = 0L
     // BS2 / BS3 用の turn 調整値。MOVE TARGET で BS2_* / BS3_* を選んでいるときの対象。
     // 以前は2つ共通の baketu_turn* だったので、保存値が無ければそれを引き継ぐ。
     private var bs2_turnx by mutableStateOf(0.0f)
@@ -343,8 +467,13 @@ class MainActivity : ComponentActivity() {
 
     // t0
     private var t0 by mutableStateOf(false)
+    // retry（電源ボタンの横）。押すと RETRY_HOLD_SECONDS の間 true を送り続け、その間は押せない。
+    // パケットのボタンの bit20（con.py の PACKET_BUTTON_KEYS の "retry"）。
+    private var retry by mutableStateOf(false)
+    private var retryRemainingSec by mutableStateOf(0)   // true を送る残りの秒（画面の表示用。切り上げ）
+    private var retryJob: Job? = null
 
-    // 画面上の物体選択（バケツ / 旗）2択排他。
+    // 画面上の物体選択（バケツ / 旗 / HOJU）3択排他。
     // 常にどれか1つが選択状態で、send() で "object" として送り続ける。
     // 未選択状態はなし（選択中のボタンを再タップしても解除されない）。
     private var selectedSpeed by mutableStateOf("baketu")
@@ -408,7 +537,7 @@ class MainActivity : ComponentActivity() {
     private var hataFarHutuuSpeed2 by mutableStateOf(10.2f)
     private var bs2Speed3 by mutableStateOf(4.5f)
     private var hataFarHutuuSpeed3 by mutableStateOf(10.2f)
-    // 旗の速度は NEAR（移動先が HATA_T / HATA_O / HOJU。共通）と FAR（それ以外。HATA_FAR・未選択・手動）の 2 か所で、
+    // 旗の速度は NEAR（移動先が HATA_T / HATA_O。共通）と FAR（それ以外。HATA_FAR・未選択・手動）の 2 か所で、
     // それぞれ HUTUU / DEKA の 2 組。hataFarHutuuSpeed1..3 は上（バケツと並んでいるもの）。
     // FAR の保存値が無ければ、元の旗の速度 hata_speed* を引き継ぐ。
     private var hataFarDekaSpeed1 by mutableStateOf(10.2f)
@@ -427,6 +556,12 @@ class MainActivity : ComponentActivity() {
     private var bs3Speed1 by mutableStateOf(4.5f)
     private var bs3Speed2 by mutableStateOf(4.5f)
     private var bs3Speed3 by mutableStateOf(4.5f)
+
+    // HOJU の射出速度（OBJECT が HOJU のとき。移動先 HOJU を選ぶと HOJU になる）。
+    // 保存値が無ければ HOJU_DEFAULT_SPEED（con.py の SETTING_DEFAULTS と同じ）。
+    private var hojuSpeed1 by mutableStateOf(HOJU_DEFAULT_SPEED)
+    private var hojuSpeed2 by mutableStateOf(HOJU_DEFAULT_SPEED)
+    private var hojuSpeed3 by mutableStateOf(HOJU_DEFAULT_SPEED)
 
     // 最後に MOVE TARGET で選んだ BS が BS3 なら true（起動直後は BS2）。
     // バケツの SPEED ADJUST の表示・調整対象と、ロボットが使う速度（packetObject()）がこれで決まる。
@@ -476,6 +611,22 @@ class MainActivity : ComponentActivity() {
         t0LockJob = lifecycleScope.launch {
             delay((t0CooldownSeconds * 1000).toLong())  // 2000ms??
             t0Locked = false            // ?????
+        }
+    }
+    private fun startRetry() {
+        if (retry) return
+        retry = true
+        retryJob?.cancel()
+        retryJob = lifecycleScope.launch {
+            try {
+                for (left in RETRY_HOLD_SECONDS downTo 1) {
+                    retryRemainingSec = left
+                    delay(1000L)
+                }
+            } finally {
+                retry = false
+                retryRemainingSec = 0
+            }
         }
     }
     // ?????logList?????????
@@ -647,6 +798,12 @@ class MainActivity : ComponentActivity() {
             vy = if (Math.abs(rawVy) > 0.1f) rawVy else 0f
             w = if (Math.abs(rawW) > 0.1f) rawW else 0f
 
+            // 前後のスティックを倒したら移動バケツを解除する（ロボットの drive2 と同じ規則。hojuIdoubake の説明）
+            if (hojuIdoubake && hojuLineStickTilted()) {
+                hojuIdoubake = false
+                appendLog("HOJU TURN: HOJU (stick)")
+            }
+
             left = rawHori < -0.5f
             right = rawHori > 0.5f
             up = rawVer < -0.5f
@@ -795,7 +952,7 @@ class MainActivity : ComponentActivity() {
                 }
                 KeyEvent.KEYCODE_BUTTON_START -> { start = true; return true }
                 // SELECT ボタンで、BS 系を選んでいれば BS ボタンを押したときと同じく次へ送る。
-                // HATA_T / HATA_O を選んでいれば、もう一方に切り替える。
+                // HATA_T / HATA_O を選んでいれば、もう一方に切り替える。HOJU なら hoju turn <-> idoubake turn を切り替える。
                 KeyEvent.KEYCODE_BUTTON_SELECT -> {
                     select = true
                     if (event.repeatCount == 0) {
@@ -899,6 +1056,10 @@ class MainActivity : ComponentActivity() {
         hoju_turnx = f("hoju_turnx", hoju_turnx)
         hoju_turny = f("hoju_turny", hoju_turny)
         hoju_turntheta = f("hoju_turntheta", hoju_turntheta)
+        idoubake_turnx = f("idoubake_turnx", idoubake_turnx)
+        idoubake_turny = f("idoubake_turny", idoubake_turny)
+        idoubake_turntheta = f("idoubake_turntheta", idoubake_turntheta)
+        idoubakeSpeedDif = f("idoubake_speed_dif", idoubakeSpeedDif)
         // bs2 / bs3_turn* がまだ無い（共通の baketu_turn* だった頃の）設定値なら、baketu_turn* を引き継ぐ。
         bs2_turnx = f("bs2_turnx", f("baketu_turnx", bs2_turnx))
         bs2_turny = f("bs2_turny", f("baketu_turny", bs2_turny))
@@ -935,6 +1096,9 @@ class MainActivity : ComponentActivity() {
         bs3Speed1 = f("bs3_speed1", f("baketu_bs3_speed1", bs2Speed1))
         bs3Speed2 = f("bs3_speed2", f("baketu_bs3_speed2", bs2Speed2))
         bs3Speed3 = f("bs3_speed3", f("baketu_bs3_speed3", bs2Speed3))
+        hojuSpeed1 = f("hoju_speed1", hojuSpeed1)
+        hojuSpeed2 = f("hoju_speed2", hojuSpeed2)
+        hojuSpeed3 = f("hoju_speed3", hojuSpeed3)
         // 値を入れ終わってから同期済みにする（sendLoop が古い値を synced=true で送らないように）。
         settingsSynced = true
         // 手元の SharedPreferences はキャッシュとして更新しておく。
@@ -943,7 +1107,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * LoRa で届いた con.py の設定値（72 バイト、送るパケットの 14〜85 バイトと同じ並び・倍率）を反映する。
+     * LoRa で届いた con.py の設定値（87 バイト、送るパケットの 14〜100 バイトと同じ並び・倍率。最後の 1 バイトは空き）を反映する。
      * Wi-Fi が無く、ログ用ポート 5006 の "settings" が届かないときの SYNC 用。
      */
     private fun applyLoraSettings(mapIndex: Int, data: ByteArray) {
@@ -994,31 +1158,30 @@ class MainActivity : ComponentActivity() {
         val wifi = lastPoseNanos != 0L && System.nanoTime() - lastPoseNanos < LINK_WIFI_TIMEOUT_MS * 1_000_000
         linkWifiOk = wifi
         val now = System.currentTimeMillis()
-        loraState = es920.state
-        loraActiveCh = es920.channel
-        when (es920.state) {
-            Es920State.NO_DEVICE -> {
-                linkLoraText = "LORA NO USB"
-                linkLoraOk = false
-            }
-            Es920State.STARTING -> {
-                linkLoraText = "LORA START..."
-                linkLoraOk = false
-            }
-            Es920State.READY -> {
-                // スマホのモジュールが送れているか（返事 OK）
-                val txOk = now - es920.lastSendOkMs < LINK_LORA_TIMEOUT_MS
-                // PC の行（状態・ログ・設定値）が届いているか。PC は届いた行に返すので、届けば PC にも届いている。
-                val pcRx = now - es920.lastPcRxMs < LINK_LORA_TIMEOUT_MS
-                // UP: PC がこちらの行を受け取れているか。Wi-Fi が生きている間は PC が UDP で知らせてくる。
-                // DN: こちらが PC の行を受け取れているか。Wi-Fi が生きている間は PC が送ってこない（無駄な電波を出さない）ので "--"。
-                val up = if (wifi) pcHearsLora else pcRx
-                val down: Boolean? = if (wifi) null else pcRx
-                fun okNg(v: Boolean) = if (v) "OK" else "NG"
-                linkLoraText = if (!txOk) "LORA TX NG" else "LORA UP ${okNg(up)} DN ${down?.let(::okNg) ?: "--"}"
-                linkLoraOk = txOk && up && down != false
+        loraState = es920.links.map { it.state }
+        loraActiveCh = es920.links.map { it.channel }
+        val status = es920.links.map { link ->
+            val head = "LORA ${link.name}"
+            when (link.state) {
+                Es920State.NO_DEVICE -> "$head NO USB" to false
+                Es920State.STARTING -> "$head START..." to false
+                Es920State.READY -> {
+                    // スマホのモジュールが送れているか（返事 OK）
+                    val txOk = now - link.lastSendOkMs < LINK_LORA_TIMEOUT_MS
+                    // PC の行（状態・ログ・設定値）が届いているか。PC は届いた行に返すので、届けば PC にも届いている。
+                    val pcRx = now - link.lastPcRxMs < LINK_LORA_TIMEOUT_MS
+                    // UP: PC がこちらの行を受け取れているか。Wi-Fi が生きている間は PC が UDP で知らせてくる。
+                    // DN: こちらが PC の行を受け取れているか。Wi-Fi が生きている間は PC が送ってこない（無駄な電波を出さない）ので "--"。
+                    val up = if (wifi) ((pcHearsLora shr link.index) and 1) != 0 else pcRx
+                    val down: Boolean? = if (wifi) null else pcRx
+                    fun okNg(v: Boolean) = if (v) "OK" else "NG"
+                    (if (!txOk) "$head TX NG" else "$head UP ${okNg(up)} DN ${down?.let(::okNg) ?: "--"}") to
+                        (txOk && up && down != false)
+                }
             }
         }
+        linkLoraText = status.map { it.first }
+        linkLoraOk = status.map { it.second }
     }
 
     private fun loadSideFloat(mapId: String, name: String, default: Float): Float =
@@ -1043,6 +1206,10 @@ class MainActivity : ComponentActivity() {
         hoju_turnx = loadSideFloat(mapId, "hoju_turnx", 0.0f)
         hoju_turny = loadSideFloat(mapId, "hoju_turny", 0.0f)
         hoju_turntheta = loadSideFloat(mapId, "hoju_turntheta", 0.0f)
+        idoubake_turnx = loadSideFloat(mapId, "idoubake_turnx", 0.0f)
+        idoubake_turny = loadSideFloat(mapId, "idoubake_turny", 0.0f)
+        idoubake_turntheta = loadSideFloat(mapId, "idoubake_turntheta", 0.0f)
+        idoubakeSpeedDif = loadSideFloat(mapId, "idoubake_speed_dif", 0.0f)
         // bs2 / bs3_turn* の保存値が無ければ、共通だった頃の baketu_turn* を引き継ぐ（baketu は saveSettings で消す）。
         val baketuTurnX = loadSideFloat(mapId, "baketu_turnx", 0.0f)
         val baketuTurnY = loadSideFloat(mapId, "baketu_turny", 0.0f)
@@ -1082,6 +1249,9 @@ class MainActivity : ComponentActivity() {
         bs3Speed1 = loadSideFloat(mapId, "bs3_speed1", loadSideFloat(mapId, "baketu_bs3_speed1", bs2Speed1))
         bs3Speed2 = loadSideFloat(mapId, "bs3_speed2", loadSideFloat(mapId, "baketu_bs3_speed2", bs2Speed2))
         bs3Speed3 = loadSideFloat(mapId, "bs3_speed3", loadSideFloat(mapId, "baketu_bs3_speed3", bs2Speed3))
+        hojuSpeed1 = loadSideFloat(mapId, "hoju_speed1", HOJU_DEFAULT_SPEED)
+        hojuSpeed2 = loadSideFloat(mapId, "hoju_speed2", HOJU_DEFAULT_SPEED)
+        hojuSpeed3 = loadSideFloat(mapId, "hoju_speed3", HOJU_DEFAULT_SPEED)
         loadedSettingsMapID = mapId
         appendLog("SETTINGS LOADED: $mapId")
     }
@@ -1125,6 +1295,10 @@ class MainActivity : ComponentActivity() {
             .putFloat("${mapId}_hoju_turnx", hoju_turnx)
             .putFloat("${mapId}_hoju_turny", hoju_turny)
             .putFloat("${mapId}_hoju_turntheta", hoju_turntheta)
+            .putFloat("${mapId}_idoubake_turnx", idoubake_turnx)
+            .putFloat("${mapId}_idoubake_turny", idoubake_turny)
+            .putFloat("${mapId}_idoubake_turntheta", idoubake_turntheta)
+            .putFloat("${mapId}_idoubake_speed_dif", idoubakeSpeedDif)
             .putFloat("${mapId}_bs2_turnx", bs2_turnx)
             .putFloat("${mapId}_bs2_turny", bs2_turny)
             .putFloat("${mapId}_bs2_turntheta", bs2_turntheta)
@@ -1163,6 +1337,9 @@ class MainActivity : ComponentActivity() {
             .putFloat("${mapId}_bs3_speed1", bs3Speed1)
             .putFloat("${mapId}_bs3_speed2", bs3Speed2)
             .putFloat("${mapId}_bs3_speed3", bs3Speed3)
+            .putFloat("${mapId}_hoju_speed1", hojuSpeed1)
+            .putFloat("${mapId}_hoju_speed2", hojuSpeed2)
+            .putFloat("${mapId}_hoju_speed3", hojuSpeed3)
             // 引き継ぎ済みなので、前の名前の baketu_speed* / baketu_bs3_speed* と、なくしたデカ雑巾の速度は消す。
             .remove("${mapId}_baketu_speed1")
             .remove("${mapId}_baketu_speed2")
@@ -1182,7 +1359,8 @@ class MainActivity : ComponentActivity() {
         // turn 調整値と射出速度は赤ゾーン / 青ゾーンで別に保存するので、
         // ここでは読まない。サイドが決まった時点（onSelectTeam）で loadSettings() を呼ぶ。
         hideSystemUI()
-        startLockTaskMode()
+        // 画面ピン留めは、フィールド選択画面を終えてコントローラーの画面に入るとき（onSelectTeam）にする。
+        // フィールド選択画面の間は ES920LR の USB の許可ダイアログを出せるように、ピン留めしない。
 
         // Wi-Fi / モバイル回線の判定は起動時の1回だけ。
         otherNetworkUp = isOtherNetworkConnected()
@@ -1192,8 +1370,8 @@ class MainActivity : ComponentActivity() {
         registerSendPaths()
         // ES920LR（LoRa）。挿さっていなければ 1 秒ごとに探し続ける。
         es920.start(lifecycleScope)
-        loraSelectedCh = es920.channel
-        loraActiveCh = es920.channel
+        loraSelectedCh = es920.links.map { it.channel }
+        loraActiveCh = es920.links.map { it.channel }
 
         // --- ???? ---
         // ???????????????????????????????????
@@ -1236,13 +1414,19 @@ class MainActivity : ComponentActivity() {
 
             // ????????????????????????
             launch { sendLoop() }
+            // 相手のバケツの位置は画面に関係なく（フィールド選択画面でも）送る
+            launch { enemyLoop() }
             launch { receiveLoop(socket) }
             launch { logReceiveLoop() }
         }
+        loadEnemy()
         setContent {
             when (currentScreen) {
                 ScreenState.TEAM_SELECTION -> {
                     TeamSelectionScreen(
+                        enemyX = enemyX, enemyY = enemyY, enemyZ = enemyZ,
+                        enemyConfirmed = enemyConfirmed,
+                        onEnemyChange = ::changeEnemy,
                         isFlipped = isFlipped,
                         networkWarning = otherNetworkUp,
                         onToggleFlip = { isFlipped = !isFlipped },
@@ -1250,22 +1434,31 @@ class MainActivity : ComponentActivity() {
                             profileName = es920.profileName,
                             channels = es920.channels,
                             freqMhz = es920::freqMhz,
-                            selected = loraSelectedCh,
-                            active = loraActiveCh,
-                            state = loraState,
+                            links = List(ES920_LINK_COUNT) { i ->
+                                LoraLinkUi(
+                                    name = ES920_LINK_NAMES[i],
+                                    selected = loraSelectedCh[i],
+                                    active = loraActiveCh[i],
+                                    state = loraState[i],
+                                    stats = loraStats[i]
+                                )
+                            },
+                            editLink = loraEditLink,
                             scan = loraScan,
                             scanningCh = loraScanningCh,
-                            scanAtMs = loraScanAtMs,
-                            stats = loraStats
+                            scanLink = loraScanLink,
+                            scanAtMs = loraScanAtMs
                         ),
-                        onScanLora = { es920.requestScan() },
+                        onSelectLoraLink = { loraEditLink = it },
+                        onScanLora = { es920.links[loraEditLink].requestScan() },
                         onSelectLoraChannel = ::selectLoraChannel,
                         onSelectTeam = { mapStr ->
                             // スキャン中ならやめる（操作を送れるように）
-                            es920.cancelScan()
+                            es920.links.forEach { it.cancelScan() }
                             selectedMapID = mapStr
                             loadSettings(mapStr)
                             currentScreen = ScreenState.CONTROLLER
+                            startLockTaskMode()
                         }
                     )
                 }
@@ -1288,11 +1481,16 @@ class MainActivity : ComponentActivity() {
                         hataTTurnX = hata_t_turnx, hataTTurnY = hata_t_turny, hataTTurnTheta = hata_t_turntheta,
                         hataOTurnX = hata_o_turnx, hataOTurnY = hata_o_turny, hataOTurnTheta = hata_o_turntheta,
                         hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
+                        idoubakeTurnX = idoubake_turnx, idoubakeTurnY = idoubake_turny, idoubakeTurnTheta = idoubake_turntheta,
+                        hojuIdoubake = hojuIdoubake,
                         bs2TurnX = bs2_turnx, bs2TurnY = bs2_turny, bs2TurnTheta = bs2_turntheta,
                         bs3TurnX = bs3_turnx, bs3TurnY = bs3_turny, bs3TurnTheta = bs3_turntheta,
                         selectedTurnTarget = selectedTurnTarget,
                         t0 = t0,
                         onToggleT0 = { toggleT0() },
+                        retry = retry,
+                        retryRemainingSec = retryRemainingSec,
+                        onRetry = { startRetry() },
                         left = left, right = right, up = up, down = down,
                         circle = circle, square = square, cross = cross, triangle = triangle,
                         l1 = l1, l2 = l2, r1 = r1, r2 = r2,
@@ -1316,6 +1514,11 @@ class MainActivity : ComponentActivity() {
                         speed3 = selectedObjectSpeed(3),
                         onSpeedIncrease = { column -> adjustSelectedObjectSpeed(column, speedStep) },
                         onSpeedDecrease = { column -> adjustSelectedObjectSpeed(column, -speedStep) },
+                        onSpeedAllIncrease = { adjustSelectedObjectSpeedAll(speedStep) },
+                        onSpeedAllDecrease = { adjustSelectedObjectSpeedAll(-speedStep) },
+                        idoubakeSpeedDif = idoubakeSpeedDif,
+                        onSpeedDifIncrease = { adjustIdoubakeSpeedDif(speedStep) },
+                        onSpeedDifDecrease = { adjustIdoubakeSpeedDif(-speedStep) },
                         logList = logList,
                         hojuState = hojuState,
                         t0locked = t0Locked,
@@ -1464,7 +1667,8 @@ class MainActivity : ComponentActivity() {
      */
     private suspend fun CoroutineScope.sendLoop() {
         while (isActive) {
-            if (currentScreen == ScreenState.CONTROLLER) {
+            // ES920LR を挿したあとの確認などで裏に回っている間（sendPausedForUsb）は送らない（onPause の説明）
+            if (currentScreen == ScreenState.CONTROLLER && !sendPausedForUsb) {
                 send(
                     selectedMapID,
                     if (lowGain) vy / 2f else vy,
@@ -1483,8 +1687,11 @@ class MainActivity : ComponentActivity() {
                     hoju_turnx, hoju_turny, hoju_turntheta,
                     bs2_turnx, bs2_turny, bs2_turntheta,
                     bs3_turnx, bs3_turny, bs3_turntheta,
+                    hojuSpeed1, hojuSpeed2, hojuSpeed3,
+                    idoubake_turnx, idoubake_turny, idoubake_turntheta, hojuIdoubake,
+                    idoubakeSpeedDif,
                     packetObject(), selectedPlace,
-                    hataLaser, hojuLaser, t0,
+                    hataLaser, hojuLaser, t0, retry,
                     left, right, up, down,
                     circle, triangle, square, cross,
                     l1, l2, r1, r2,
@@ -1499,6 +1706,97 @@ class MainActivity : ComponentActivity() {
     /**
      * ??????????????????????????????
      */
+    // ------------------------------------------------------------------ 相手のバケツの位置（ENEMY_* の説明）
+
+    /** 保存してある相手のバケツの位置を読む（onCreate）。 */
+    private fun loadEnemy() {
+        enemyX = prefs.getInt("enemy_x", ENEMY_DEFAULT_X).coerceIn(ENEMY_X_RANGE)
+        enemyY = prefs.getInt("enemy_y", ENEMY_DEFAULT_Y).coerceIn(ENEMY_Y_RANGE)
+        enemyZ = prefs.getInt("enemy_z", ENEMY_DEFAULT_Z).coerceIn(ENEMY_Z_RANGE)
+    }
+
+    /** フィールド選択画面の +/-。axis は 0 = x、1 = y、2 = z。変えたら保存して、すぐ送る。 */
+    private fun changeEnemy(axis: Int, delta: Int) {
+        when (axis) {
+            0 -> enemyX = (enemyX + delta).coerceIn(ENEMY_X_RANGE)
+            1 -> enemyY = (enemyY + delta).coerceIn(ENEMY_Y_RANGE)
+            else -> enemyZ = (enemyZ + delta).coerceIn(ENEMY_Z_RANGE)
+        }
+        // 画面から離れるとすぐプロセスごと終了する（exitOnPause）ので、apply ではなく commit でその場で書く（saveSettings と同じ）
+        prefs.edit().putInt("enemy_x", enemyX).putInt("enemy_y", enemyY).putInt("enemy_z", enemyZ).commit()
+        enemyLastSentMs = 0L
+    }
+
+    /** 上りの 8 バイト。 */
+    private fun enemyUpBytes(): ByteArray {
+        val b = ByteBuffer.allocate(ENEMY_UP_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+        b.put(ENEMY_TAG)
+        b.putShort(enemyX.toShort())
+        b.putShort(enemyY.toShort())
+        b.putShort(enemyZ.toShort())
+        val data = b.array()
+        var sum = 0
+        for (i in 1 until ENEMY_UP_SIZE - 1) sum += data[i].toInt() and 0xFF
+        data[ENEMY_UP_SIZE - 1] = sum.toByte()
+        return data
+    }
+
+    /** UDP で届いた PC の返事（9 バイト）。和が合えば、PC が持っている値として覚える。 */
+    private fun applyEnemyAck(buf: ByteArray) {
+        var sum = 0
+        for (i in 1 until ENEMY_ACK_SIZE - 1) sum += buf[i].toInt() and 0xFF
+        if ((sum and 0xFF) != (buf[ENEMY_ACK_SIZE - 1].toInt() and 0xFF)) {
+            appendLog("RECV ERROR: enemy ack checksum")
+            return
+        }
+        val b = ByteBuffer.wrap(buf, 1, ENEMY_ACK_SIZE - 2).order(ByteOrder.LITTLE_ENDIAN)
+        val has = b.get().toInt() != 0
+        val xyz = listOf(b.short.toInt(), b.short.toInt(), b.short.toInt())
+        enemyAck = if (has) xyz else null
+    }
+
+    /**
+     * 相手のバケツの位置を、PC に届いたと分かるまで ENEMY_RESEND_MS ごとに UDP で送り直し続ける
+     * （届いてからも ENEMY_CHECK_MS ごとに送って確かめる）。ES920LR には Es920Group.setEnemy で渡し、
+     * コントローラーの画面で操作を送る行に載せてもらう。画面に関係なく回す。
+     */
+    private suspend fun CoroutineScope.enemyLoop() {
+        var wasConfirmed = false
+        while (isActive) {
+            val up = enemyUpBytes()
+            val confirmed = enemyConfirmed
+            es920.setEnemy(up, confirmed)
+            if (confirmed != wasConfirmed) {
+                appendLog(
+                    if (confirmed) "ENEMY TARGET OK: X $enemyX Y $enemyY Z $enemyZ"
+                    else "ENEMY TARGET SENDING: X $enemyX Y $enemyY Z $enemyZ"
+                )
+                wasConfirmed = confirmed
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (now - enemyLastSentMs >= if (confirmed) ENEMY_CHECK_MS else ENEMY_RESEND_MS) {
+                enemyLastSentMs = now
+                sendUdpDirect(up)
+            }
+            delay(50)
+        }
+    }
+
+    /**
+     * 操作のパケットとは別のものを、つながっている経路すべてへ UDP で送る。経路の outbox は最新の 1 つしか残さないので
+     * （操作のパケットと入れ替わらないよう）使わず、その場で送る。IO スレッドから呼ぶ。
+     */
+    private fun sendUdpDirect(data: ByteArray) {
+        val sockets = sendPaths.toList().map { it.socket }.ifEmpty { listOf(socket) }
+        for (sock in sockets) {
+            try {
+                sock.send(DatagramPacket(data, data.size, address, port))
+            } catch (e: Exception) {
+                if (!sock.isClosed) appendLog("SEND ERROR (enemy): ${e.javaClass.simpleName} ${e.message}")
+            }
+        }
+    }
+
     private suspend fun CoroutineScope.receiveLoop(sock: DatagramSocket) {
         // 経路ごとのソケットでも回すので、ソケットが閉じられたら抜ける（経路が切れたとき）。
         val buf = ByteArray(1024)
@@ -1507,13 +1805,18 @@ class MainActivity : ComponentActivity() {
                 val packet = DatagramPacket(buf, buf.size)
                 sock.receive(packet) // ??????I/O?Dispatchers.IO???????
 
+                // 相手のバケツの位置の返事（ENEMY_* の説明）。自己位置ではないので往復時間には数えない
+                if (packet.length == ENEMY_ACK_SIZE && buf[0] == ENEMY_TAG) {
+                    applyEnemyAck(buf)
+                    continue
+                }
                 // 自己位置（バイナリ。並びは POSE_PACKET_* を参照）
                 if (packet.length == POSE_PACKET_SIZE && buf[0] == POSE_PACKET_VERSION) {
                     val pose = ByteBuffer.wrap(buf, 1, POSE_PACKET_SIZE - 1).order(ByteOrder.LITTLE_ENDIAN)
                     posX = pose.int / POSE_XY_SCALE
                     posY = pose.int / POSE_XY_SCALE
                     posTheta = pose.int / POSE_THETA_SCALE
-                    pcHearsLora = (pose.get().toInt() and 1) != 0
+                    pcHearsLora = pose.get().toInt() and 0xFF
                     lastInvalidSeq = pose.get().toInt() and 0xFF
                     lastPoseNanos = System.nanoTime()
                 } else {
@@ -1607,7 +1910,7 @@ class MainActivity : ComponentActivity() {
      * value は画面のボタンの id（"bs2" など）でも、送る移動先の id（"bs2_a" など）でもよい。
      * hata_t・hata_o / hoju に切り替わったときは、対応するレーザーを1回だけ ON にする
      * （ON のまま固定はしないので、そのあと手動で OFF にできる）。
-     * OBJECT も移動先に合わせて切り替える（BS 系 -> バケツ / hata_t・hata_o・hata_far・dekahoju -> 旗）。
+     * OBJECT も移動先に合わせて切り替える（BS 系 -> バケツ / hata_t・hata_o・hata_far・dekahoju -> 旗 / hoju -> HOJU）。
      * DEKAHOJU を選ぶと旗の速度を DEKA にする。DEKA は発射ボタンを押すまで移動では解除せず、押したあとの次の移動先で HUTUU に戻す（hataDekaFired）。
      * hata_t・hata_o・hata_far は turn 調整の対象・レーザー・OBJECT の扱いが共通。
      * turn は hata_t・hata_o・hata_far でそれぞれ別。速度は hata_t・hata_o が NEAR、hata_far が FAR（HATA_NEAR_RANGE_TARGETS）で、さらに × で HUTUU / DEKA を選ぶ。
@@ -1637,6 +1940,8 @@ class MainActivity : ComponentActivity() {
     /** 移動先を value にして、それに合わせて turn 調整の対象・レーザー・OBJECT を切り替える。 */
     private fun applyMoveTarget(value: String) {
         selectedPlace = value
+        // idoubake は HOJU の位置決め中に SELECT で選ぶもの。移動先を選び直したら hoju turn に戻す。
+        hojuIdoubake = false
         hataAdjustOtherRange = false
         baketuSpeedOtherBs = false
         if (value == "dekahoju") {
@@ -1659,6 +1964,7 @@ class MainActivity : ComponentActivity() {
             "hoju" -> {
                 setTurnTarget(TurnTarget.HOJU)
                 hojuLaser = true
+                selectedSpeed = "hoju"
             }
             "dekahoju" -> {
                 selectedSpeed = "hata"
@@ -1675,6 +1981,7 @@ class MainActivity : ComponentActivity() {
     /** L3 / R3 で MOVE TARGET を解除する。位置決めをやめるのでレーザーも両方消す。 */
     private fun clearMoveTarget() {
         selectedPlace = "none"
+        hojuIdoubake = false
         hataAdjustOtherRange = false
         baketuSpeedOtherBs = false
         hataLaser = false
@@ -1705,9 +2012,18 @@ class MainActivity : ComponentActivity() {
     /**
      * SELECT ボタンで MOVE TARGET を順送りする。選択中の移動先が順送りのボタン（BS2 / BS3）のものなら、
      * そのボタンを押したときと同じく次へ送る。HATA_T / HATA_O ならもう一方に切り替える。
+     * HOJU なら、移動バケツ（idoubake）にする（移動先は HOJU のまま。もう一度押しても戻さない。hojuIdoubake の説明）。
      * それ以外（none・HATA_FAR 含む）のときは何もしない。
      */
     private fun cycleSelectTarget() {
+        if (selectedPlace == "hoju") {
+            // ロボットの drive2 と同じく、前後のスティックを倒している間は入らない。入っていれば何もしない
+            if (!hojuIdoubake && !hojuLineStickTilted()) {
+                hojuIdoubake = true
+                appendLog("HOJU TURN: IDOUBAKE")
+            }
+            return
+        }
         // HATA_T / HATA_O を選んでいれば、もう一方に切り替える（画面で押したときと同じ扱い）。
         if (selectedPlace in HATA_NEAR_TARGETS) {
             selectMoveTarget(HATA_NEAR_TARGETS.first { it != selectedPlace })
@@ -1718,8 +2034,12 @@ class MainActivity : ComponentActivity() {
         selectMoveTarget(buttonId)
     }
 
+    /** 前後のスティック（PC へ送る値。controller_val.y）を HOJU_LINE_DEADZONE 以上倒しているか。 */
+    private fun hojuLineStickTilted(): Boolean =
+        Math.abs(if (lowGain) vx / 2f else vx) >= HOJU_LINE_DEADZONE
+
     /**
-     * PS ボタンで OBJECT を バケツ -> 旗 -> バケツ と順送りする。
+     * PS ボタンで OBJECT を バケツ -> 旗 -> HOJU -> バケツ と順送りする。
      * 並びは FIELD_OBJECTS の順番に従うので、画面のボタンの並びと一致する。
      */
     private fun cycleSelectedObject() {
@@ -1758,7 +2078,12 @@ class MainActivity : ComponentActivity() {
                     hata_t_turntheta = theta(hata_t_turntheta, dtheta)
                 }
             }
-            TurnTarget.HOJU -> {
+            // idoubake の間は、ロボットが使っている idoubake turn を動かす。
+            TurnTarget.HOJU -> if (hojuIdoubake) {
+                idoubake_turnx = xy(idoubake_turnx, dx)
+                idoubake_turny = xy(idoubake_turny, dy)
+                idoubake_turntheta = theta(idoubake_turntheta, dtheta)
+            } else {
                 hoju_turnx = xy(hoju_turnx, dx)
                 hoju_turny = xy(hoju_turny, dy)
                 hoju_turntheta = theta(hoju_turntheta, dtheta)
@@ -1811,6 +2136,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        "hoju" -> when (column) {
+            1 -> hojuSpeed1
+            2 -> hojuSpeed2
+            else -> hojuSpeed3
+        }
         // バケツは最後に選んだ BS（baketuBs3）の方を出す。BS2 / BS3 ボタンでもう一方を出しているときだけ、撃つ組と違う。
         else -> if (baketuSpeedShowsBs3) {
             when (column) {
@@ -1848,6 +2178,29 @@ class MainActivity : ComponentActivity() {
         baketuSpeedOtherBs = bs3 != baketuBs3
     }
 
+    /**
+     * SPEED ADJUST の ALL: 表示中の組の C1〜C3 をまとめて delta 分動かす。
+     * どれか 1 つでも範囲を出るなら、どれも動かさない（C1〜C3 の差を保つため）。
+     */
+    private fun adjustSelectedObjectSpeedAll(delta: Float) {
+        if (!settingsSynced) return
+        val range = speedRangeFor(selectedSpeed)
+        // 0.01 刻みの足し引きで誤差が乗るので、端との比較は少し余裕を持たせる（SpeedAdjustRow と同じ）。
+        val fits = (1..3).all { column ->
+            val v = (selectedObjectSpeed(column) + delta).roundToScale(SPEED_SCALE)
+            v >= range.start - 1e-4f && v <= range.endInclusive + 1e-4f
+        }
+        if (!fits) return
+        for (column in 1..3) adjustSelectedObjectSpeed(column, delta)
+    }
+
+    /** 移動バケツの射出速度の差を delta 分動かす（IDOUBAKE_SPEED_DIF_MIN〜MAX）。 */
+    private fun adjustIdoubakeSpeedDif(delta: Float) {
+        if (!settingsSynced) return
+        idoubakeSpeedDif = (idoubakeSpeedDif + delta).roundToScale(SPEED_SCALE)
+            .coerceIn(IDOUBAKE_SPEED_DIF_MIN, IDOUBAKE_SPEED_DIF_MAX)
+    }
+
     /** 選択中の OBJECT の column（1..3）の速度を delta 分動かす。範囲は物体ごと。 */
     private fun adjustSelectedObjectSpeed(column: Int, delta: Float) {
         if (!settingsSynced) return
@@ -1881,6 +2234,11 @@ class MainActivity : ComponentActivity() {
                         else -> hataFarHutuuSpeed3 = clamp(hataFarHutuuSpeed3 + delta)
                     }
                 }
+            }
+            "hoju" -> when (column) {
+                1 -> hojuSpeed1 = clamp(hojuSpeed1 + delta)
+                2 -> hojuSpeed2 = clamp(hojuSpeed2 + delta)
+                else -> hojuSpeed3 = clamp(hojuSpeed3 + delta)
             }
             else -> if (baketuSpeedShowsBs3) {
                 when (column) {
@@ -1924,7 +2282,7 @@ class MainActivity : ComponentActivity() {
     // con.py の PACKET_SEQ_SHIFT / PACKET_SEQ_MASK と必ず合わせる。
     private var packetSeq = 0
 
-    /** ロボットへ送る OBJECT。旗は NEAR / FAR と HUTUU / DEKA、バケツは BS2 / BS3 まで入れる（mast2 の input.cpp がこの名前の組で撃つ）。 */
+    /** ロボットへ送る OBJECT。旗は NEAR / FAR と HUTUU / DEKA、バケツは BS2 / BS3 まで入れる。HOJU は "hoju"（mast2 の input.cpp がこの名前の組で撃つ）。 */
     private fun packetObject(): String = when (selectedSpeed) {
         "baketu" -> if (baketuBs3) "baketu_bs3" else "baketu_bs2"
         "hata" -> {
@@ -1951,8 +2309,11 @@ class MainActivity : ComponentActivity() {
         hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
         bs2TurnX: Float, bs2TurnY: Float, bs2TurnTheta: Float,
         bs3TurnX: Float, bs3TurnY: Float, bs3TurnTheta: Float,
+        hojuSpeed1: Float, hojuSpeed2: Float, hojuSpeed3: Float,
+        idoubakeTurnX: Float, idoubakeTurnY: Float, idoubakeTurnTheta: Float, idoubake: Boolean,
+        idoubakeSpeedDif: Float,
         selectedSpeed: String, selectedPlace: String,
-        hataLaser: Boolean, hojuLaser: Boolean, t0: Boolean,
+        hataLaser: Boolean, hojuLaser: Boolean, t0: Boolean, retry: Boolean,
         left: Boolean, right: Boolean, up: Boolean, down: Boolean,
         circle: Boolean, triangle: Boolean, square: Boolean, cross: Boolean,
         l1: Boolean, l2: Boolean, r1: Boolean, r2: Boolean,
@@ -1965,7 +2326,7 @@ class MainActivity : ComponentActivity() {
             //  1      u8    map_id（PACKET_MAP_IDS の番号）
             //  2      u8    object（PACKET_OBJECT_IDS の番号）
             //  3      u8    target（PACKET_TARGET_IDS の番号）
-            //  4      u32   bit0-19: ボタン類（bit0 から下の buttons の並び）、bit20-21: 未使用、bit22-31: 通し番号（packetSeq）
+            //  4      u32   bit0-21: ボタン類（bit0 から下の buttons の並び。bit20 は retry、bit21 は idoubake）、bit22-31: 通し番号（packetSeq）
             //  8      i16×3 vx / vy / w
             // 14      i16×9 turn（bs2 / 旗の FAR 用 / hoju の x, y, theta）
             // 32      i16×6 speed（旗の FAR の HUTUU 用 / bs2 の 1..3）
@@ -1975,13 +2336,17 @@ class MainActivity : ComponentActivity() {
             // 62      i16×6 speed（旗の NEAR の HUTUU 用の 1..3、DEKA 用の 1..3）
             // 74      i16×3 speed（旗の FAR の DEKA 用の 1..3）
             // 80      i16×3 turn（旗の HATA_O 用の x, y, theta）
+            // 86      i16×3 speed（hoju の 1..3）
+            // 92      i16×3 turn（移動バケツ idoubake 用の x, y, theta）
+            // 98      i16   移動バケツの射出速度の差 idoubake_speed_dif（2026-11-08）
+            // 100     u8    空き（0。設定値を 29 byte × 3 に割り切るため）
             val buttons = listOf(
                 left, right, up, down,
                 circle, triangle, square, cross,
                 l1, l2, r1, r2,
                 start, select, ps,
                 hataLaser, hojuLaser, t0, synced,
-                hataO
+                hataO, retry, idoubake
             ).foldIndexed(0) { bit, acc, on -> if (on) acc or (1 shl bit) else acc }
 
             val buf = ByteBuffer.allocate(PACKET_SIZE).order(ByteOrder.LITTLE_ENDIAN)
@@ -2032,6 +2397,14 @@ class MainActivity : ComponentActivity() {
             buf.putScaled(hataOTurnX, TURN_XY_SCALE)
             buf.putScaled(hataOTurnY, TURN_XY_SCALE)
             buf.putScaled(hataOTurnTheta, TURN_THETA_SCALE)
+            buf.putScaled(hojuSpeed1, SPEED_SCALE)
+            buf.putScaled(hojuSpeed2, SPEED_SCALE)
+            buf.putScaled(hojuSpeed3, SPEED_SCALE)
+            buf.putScaled(idoubakeTurnX, TURN_XY_SCALE)
+            buf.putScaled(idoubakeTurnY, TURN_XY_SCALE)
+            buf.putScaled(idoubakeTurnTheta, TURN_THETA_SCALE)
+            buf.putScaled(idoubakeSpeedDif, SPEED_SCALE)
+            // 100 byte 目は空き（allocate で 0 のまま）
 
             sendTime = System.nanoTime()
             // LoRa にも同じものを渡す（送るのは Es920Link のループ。ここでは待たない）。
@@ -2079,10 +2452,33 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // ES920LR を挿したときの確認・UsbAttachActivity から戻った。また送る（onPause の説明）
+        sendPausedForUsb = false
+    }
+
     override fun onPause() {
         super.onPause()
         // ES920LR の USB 許可ダイアログでも onPause が来る。ここで終了すると許可できないので、その間は残す。
         if (es920.permissionPending) return
+        // ES920LR を挿した直後（まだどの組も開いていないモジュールがある）は、初めての「Controller で開く」の確認や
+        // UsbAttachActivity が前に出る。そのときは終了せず、戻ってくる（onResume）までずっと待つ。
+        // 待っている間は送らない（裏に回ったまま古い操作を送り続けないため。ロボットは途絶として止まる。今までの終了と同じ）。
+        // それ以外（ふつうに別のアプリへ移ったときなど）は今までどおりすぐ終了する。
+        if (es920.hasFreeDevice()) {
+            sendPausedForUsb = true
+            return
+        }
+        exitOnPause()
+    }
+
+    // ES920LR を挿した直後の onPause で、終了せずに待っている間は true（送らない）。onResume で false
+    @Volatile
+    private var sendPausedForUsb = false
+
+    /** onPause でアプリを終了する（送るのをやめ、プロセスごと閉じる）。 */
+    private fun exitOnPause() {
         stopHataTurnRepeat()
         saveSettings()
         // ??????????????????????????????????
@@ -2298,6 +2694,40 @@ private fun SpeedAdjustRow(
     }
 }
 
+/**
+ * SPEED ADJUST の ALL の行。表示中の組の C1〜C3 をまとめて +/- する。
+ * どれか 1 つでも上限 / 下限に届いている側のボタンは無効（灰色）にする（差を保つため、そこで止める）。
+ */
+@Composable
+private fun SpeedAdjustAllRow(
+    modifier: Modifier = Modifier,
+    values: List<Float>,
+    range: ClosedFloatingPointRange<Float>,
+    onIncrease: () -> Unit,
+    onDecrease: () -> Unit,
+    accent: Color = ControllerColors.Accent,
+    enabled: Boolean = true
+) {
+    // 0.01 刻みの足し引きで誤差が乗るので、端との比較は少し余裕を持たせる（SpeedAdjustRow と同じ）。
+    val canDecrease = enabled && values.all { it > range.start + 1e-4f }
+    val canIncrease = enabled && values.all { it < range.endInclusive - 1e-4f }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = modifier.fillMaxWidth()
+    ) {
+        Text(
+            text = "ALL",
+            color = accent,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.weight(1f)
+        )
+        SpeedStepButton(text = "-", enabled = canDecrease, onStep = onDecrease, accent = accent)
+        SpeedStepButton(text = "+", enabled = canIncrease, onStep = onIncrease, accent = accent)
+    }
+}
+
 /** SPEED ADJUST で組（旗の NEAR / FAR、HUTUU / DEKA、バケツの BS2 / BS3）を選ぶボタン。旗は 4 つ並ぶので余白を詰めてある。 */
 @Composable
 private fun SpeedSetChip(
@@ -2383,8 +2813,8 @@ private fun SpeedStepButton(
         onClick = {},
         enabled = enabled,
         interactionSource = interactionSource,
-        // 行の高さに合わせて縮む（旗は組を選ぶボタンのぶん行が低くなる）。
-        modifier = Modifier.width(38.dp).heightIn(max = 44.dp).fillMaxHeight(),
+        // 行の高さに合わせて縮む（旗は組を選ぶボタンのぶん行が低くなる）。押しやすいよう 38 x 44dp から広げた。
+        modifier = Modifier.width(44.dp).heightIn(max = 56.dp).fillMaxHeight(),
         shape = shape,
         colors = ButtonDefaults.buttonColors(
             containerColor = containerColor,
@@ -2409,7 +2839,7 @@ private fun SpeedStepButton(
         ) {
             Text(
                 text = text,
-                fontSize = 18.sp,
+                fontSize = 20.sp,
                 fontWeight = FontWeight.Bold,
                 color = contentColor
             )
@@ -2422,12 +2852,17 @@ private fun SpeedStepButton(
  */
 @Composable
 fun TeamSelectionScreen(
+    // 相手のバケツの位置 [mm] と、PC に届いているか。+/- で onEnemyChange(axis 0 = x / 1 = y / 2 = z, 増やす量)
+    enemyX: Int, enemyY: Int, enemyZ: Int,
+    enemyConfirmed: Boolean,
+    onEnemyChange: (axis: Int, delta: Int) -> Unit,
     isFlipped: Boolean,
     // 起動時に Wi-Fi / モバイル回線がつながっていたら true。背景の点滅と警告を出す。
     networkWarning: Boolean,
     onToggleFlip: () -> Unit,
     // ES920LR のチャンネルの表示と操作（右側のパネル）
     lora: LoraChannelUi,
+    onSelectLoraLink: (Int) -> Unit,
     onScanLora: () -> Unit,
     onSelectLoraChannel: (Int) -> Unit,
     onSelectTeam: (mapStr: String) -> Unit
@@ -2446,7 +2881,8 @@ fun TeamSelectionScreen(
         ) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(32.dp)
+                // 2026-11-08 に下へ ENEMY TARGET を足したので 32 -> 16 に詰めた
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 Text(
                     text = "SELECT FIELD SIDE",
@@ -2509,8 +2945,54 @@ fun TeamSelectionScreen(
                     height = 50.dp,
                     accent = if (isFlipped) ControllerColors.Warning else ControllerColors.Border
                 )
+                EnemyTargetPanel(enemyX, enemyY, enemyZ, enemyConfirmed, onEnemyChange)
             }
-            LoraChannelPanel(lora = lora, onScan = onScanLora, onSelect = onSelectLoraChannel)
+            LoraChannelPanel(lora = lora, onSelectLink = onSelectLoraLink, onScan = onScanLora, onSelect = onSelectLoraChannel)
+        }
+    }
+}
+
+/**
+ * フィールド選択画面の ENEMY TARGET。相手のバケツ（底の高さ）をゾーン基準の mm で選ぶ（ENEMY_* の説明）。
+ * 見出しの右に、PC に届いているか（PC OK / SENDING...）を出す。届くまでアプリが送り直し続ける。
+ */
+@Composable
+private fun EnemyTargetPanel(
+    x: Int, y: Int, z: Int,
+    confirmed: Boolean,
+    onChange: (axis: Int, delta: Int) -> Unit
+) {
+    HudPanel(modifier = Modifier.width(400.dp), contentPadding = 6.dp) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Box(modifier = Modifier.weight(1f)) { HudSectionTitle(text = "ENEMY TARGET (mm)") }
+            Text(
+                text = if (confirmed) "PC OK" else "SENDING...",
+                color = if (confirmed) ControllerColors.Success else ControllerColors.Warning,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("X" to x, "Y" to y, "Z" to z).forEachIndexed { axis, (label, value) ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    HudButton(
+                        text = "-", onClick = { onChange(axis, -ENEMY_STEP) },
+                        modifier = Modifier.width(34.dp), height = 34.dp, fontSize = 16.sp
+                    )
+                    Text(
+                        text = "$label $value",
+                        color = ControllerColors.TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.width(58.dp)
+                    )
+                    HudButton(
+                        text = "+", onClick = { onChange(axis, ENEMY_STEP) },
+                        modifier = Modifier.width(34.dp), height = 34.dp, fontSize = 16.sp
+                    )
+                }
+            }
         }
     }
 }
@@ -2520,16 +3002,28 @@ class LoraChannelUi(
     val profileName: String,
     val channels: IntRange,
     val freqMhz: (Int) -> Double,
+    /** 組ごと（0 = A、1 = B）の表示 */
+    val links: List<LoraLinkUi>,
+    /** タイルを押したとき・SCAN でチャンネルを変える組 */
+    val editLink: Int,
+    /** 最後のスキャンの結果（どちらの組で調べても混み具合は同じ） */
+    val scan: List<Es920ChannelScan>,
+    /** 今スキャンで試しているチャンネル（0 はスキャンしていない） */
+    val scanningCh: Int,
+    /** スキャンしている（した）組 */
+    val scanLink: Int,
+    /** スキャンが終わった時刻（0 はまだ） */
+    val scanAtMs: Long
+)
+
+/** LORA CHANNEL パネルの組 1 つ分。 */
+class LoraLinkUi(
+    val name: String,
     /** 選んだチャンネル */
     val selected: Int,
     /** モジュールに設定してあるチャンネル（切り替え中は selected と違う） */
     val active: Int,
     val state: Es920State,
-    val scan: List<Es920ChannelScan>,
-    /** 今スキャンで試しているチャンネル（0 はスキャンしていない） */
-    val scanningCh: Int,
-    /** スキャンが終わった時刻（0 はまだ） */
-    val scanAtMs: Long,
     /** 最後の 5 秒ごとの送信の統計（コントローラーの画面で送っていた間のもの） */
     val stats: Es920Stats?
 )
@@ -2545,50 +3039,61 @@ private fun loraBusyColor(rate: Double): Color = when {
 }
 
 /**
- * ES920LR のチャンネルを選ぶパネル。SCAN で全チャンネルを試し、NG 102（キャリアセンスで送れなかった =
- * 誰かが使っている）の割合をタイルに出す。タイルを押すとそのチャンネルに切り替える（PC は追いかけてくる）。
+ * ES920LR のチャンネルを選ぶパネル。上の A / B で組を選び、タイルを押すとその組のチャンネルを切り替える（PC は追いかけてくる）。
+ * SCAN は選んでいる組のモジュールで全チャンネルを試し、NG 102（キャリアセンスで送れなかった = 誰かが使っている）の割合をタイルに出す。
  */
 @Composable
-private fun LoraChannelPanel(lora: LoraChannelUi, onScan: () -> Unit, onSelect: (Int) -> Unit) {
+private fun LoraChannelPanel(
+    lora: LoraChannelUi,
+    onSelectLink: (Int) -> Unit,
+    onScan: () -> Unit,
+    onSelect: (Int) -> Unit
+) {
     val scanByCh = lora.scan.associateBy { it.channel }
     val scanning = lora.scanningCh != 0
+    val edit = lora.links[lora.editLink]
     HudPanel(modifier = Modifier.width(300.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             Box(modifier = Modifier.weight(1f)) { HudSectionTitle(text = "LORA CHANNEL") }
             HudButton(
-                text = if (scanning) "SCAN ${lora.scanningCh}/${lora.channels.last}" else "SCAN",
+                text = if (scanning) "SCAN ${lora.links[lora.scanLink].name} ${lora.scanningCh}/${lora.channels.last}"
+                else "SCAN ${edit.name}",
                 onClick = onScan,
                 modifier = Modifier.width(120.dp),
-                enabled = lora.state == Es920State.READY && !scanning,
+                enabled = edit.state == Es920State.READY && !scanning,
                 height = 36.dp,
                 fontSize = 13.sp,
                 accent = ControllerColors.Accent
             )
         }
-        // 今のチャンネルとモジュールの状態
-        val (stateText, stateColor) = when {
-            lora.state == Es920State.NO_DEVICE -> "NO USB" to ControllerColors.Danger
-            lora.state == Es920State.STARTING -> "START..." to ControllerColors.Warning
-            scanning -> "SCANNING" to ControllerColors.Warning
-            lora.selected != lora.active -> "SWITCHING" to ControllerColors.Warning
-            else -> "READY" to ControllerColors.Success
+        // 組ごとのチャンネルとモジュールの状態。押すと、タイルで変える組になる
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            lora.links.forEachIndexed { i, link ->
+                LoraLinkChip(
+                    link = link,
+                    freqMhz = lora.freqMhz(link.selected),
+                    editing = i == lora.editLink,
+                    scanning = scanning && i == lora.scanLink,
+                    onClick = { onSelectLink(i) },
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = "CH ${lora.selected}  ${"%.1f".format(lora.freqMhz(lora.selected))} MHz  ",
-                color = ControllerColors.TextPrimary,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold
-            )
-            Text(text = stateText, color = stateColor, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-        }
-        // 直近の送信の統計（NG 102 が多ければ、今のチャンネルが混んでいる）
-        val stats = lora.stats
+        // 2 組のチャンネルが近いと、スマホの上で片方の送信がもう片方の受信を邪魔しうる
+        val gap = lora.links.zipWithNext { a, b -> kotlin.math.abs(a.selected - b.selected) }.minOrNull()
+        val stats = edit.stats
         Text(
-            text = if (stats == null) "${lora.profileName} · 送信の統計はまだない"
-            else "直近 5 秒 ch${stats.channel}: %.1f Hz · NG102 %d/%d (%.0f%%)".format(
-                stats.hz, stats.busy, stats.attempts, stats.busyRate * 100),
-            color = if (stats == null) ControllerColors.TextSecondary else loraBusyColor(stats.busyRate),
+            text = when {
+                gap != null && gap < ES920_MIN_CHANNEL_GAP -> "A と B が近い（$gap ch）。$ES920_MIN_CHANNEL_GAP ch 以上離す"
+                stats == null -> "${lora.profileName} · ${edit.name} の送信の統計はまだない"
+                else -> "${edit.name} 直近 5 秒 ch${stats.channel}: %.1f Hz · NG102 %d/%d (%.0f%%)".format(
+                    stats.hz, stats.busy, stats.attempts, stats.busyRate * 100)
+            },
+            color = when {
+                gap != null && gap < ES920_MIN_CHANNEL_GAP -> ControllerColors.Warning
+                stats == null -> ControllerColors.TextSecondary
+                else -> loraBusyColor(stats.busyRate)
+            },
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold
         )
@@ -2596,12 +3101,16 @@ private fun LoraChannelPanel(lora: LoraChannelUi, onScan: () -> Unit, onSelect: 
         lora.channels.chunked(LORA_TILES_PER_ROW).forEach { row ->
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 row.forEach { ch ->
+                    // このチャンネルを選んでいる組（選んでいる組の印と、もう片方の組の印）
+                    val owner = lora.links.indexOfFirst { it.selected == ch }
                     LoraChannelTile(
                         ch = ch,
                         result = scanByCh[ch],
-                        selected = ch == lora.selected,
+                        owner = if (owner >= 0) lora.links[owner].name else null,
+                        selected = owner == lora.editLink,
                         scanningNow = ch == lora.scanningCh,
-                        enabled = !scanning,
+                        // もう片方の組のチャンネルは押せない
+                        enabled = !scanning && (owner < 0 || owner == lora.editLink),
                         onClick = { onSelect(ch) }
                     )
                 }
@@ -2609,7 +3118,7 @@ private fun LoraChannelPanel(lora: LoraChannelUi, onScan: () -> Unit, onSelect: 
         }
         Text(
             text = "% = NG 102（誰かが使っていて送れなかった）の割合。" +
-                "押すと切り替え。${ES920_SLOW_CHANNELS.first}〜${ES920_SLOW_CHANNELS.last} は送るたび 50 ms 休むので遅い" +
+                "押すと ${edit.name} を切り替え。${ES920_SLOW_CHANNELS.first}〜${ES920_SLOW_CHANNELS.last} は送るたび 50 ms 休むので遅い" +
                 if (lora.scanAtMs > 0) "。SCAN ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(lora.scanAtMs)}" else "",
             color = ControllerColors.TextSecondary,
             fontSize = 10.sp,
@@ -2618,10 +3127,50 @@ private fun LoraChannelPanel(lora: LoraChannelUi, onScan: () -> Unit, onSelect: 
     }
 }
 
+/** LORA CHANNEL パネルの組 1 つ分の札（"A CH10 READY"）。editing: タイルで変える組。 */
+@Composable
+private fun LoraLinkChip(
+    link: LoraLinkUi,
+    freqMhz: Double,
+    editing: Boolean,
+    scanning: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val shape = RoundedCornerShape(6.dp)
+    val (stateText, stateColor) = when {
+        link.state == Es920State.NO_DEVICE -> "NO USB" to ControllerColors.Danger
+        link.state == Es920State.STARTING -> "START..." to ControllerColors.Warning
+        scanning -> "SCANNING" to ControllerColors.Warning
+        link.selected != link.active -> "SWITCHING" to ControllerColors.Warning
+        else -> "READY" to ControllerColors.Success
+    }
+    Column(
+        modifier = modifier
+            .background(if (editing) ControllerColors.Accent.copy(alpha = 0.22f) else ControllerColors.Surface2, shape)
+            .border(if (editing) 2.dp else 1.dp, if (editing) ControllerColors.Accent else ControllerColors.Border, shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 3.dp)
+    ) {
+        Text(
+            text = "${link.name}  CH ${link.selected}  ${"%.1f".format(freqMhz)}",
+            color = ControllerColors.TextPrimary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            lineHeight = 14.sp,
+            maxLines = 1
+        )
+        Text(text = stateText, color = stateColor, fontSize = 10.sp, fontWeight = FontWeight.Bold, lineHeight = 12.sp)
+    }
+}
+
 @Composable
 private fun LoraChannelTile(
     ch: Int,
     result: Es920ChannelScan?,
+    // このチャンネルを選んでいる組の名前（どちらも選んでいなければ null）
+    owner: String?,
+    // タイルで変えている組のチャンネル
     selected: Boolean,
     scanningNow: Boolean,
     enabled: Boolean,
@@ -2629,15 +3178,25 @@ private fun LoraChannelTile(
 ) {
     val shape = RoundedCornerShape(6.dp)
     val color = result?.let { loraBusyColor(it.busyRate) } ?: ControllerColors.TextMuted
+    // もう片方の組のチャンネル
+    val other = owner != null && !selected
     Box(
         modifier = Modifier
             .size(width = 52.dp, height = 38.dp)
-            .background(if (selected) ControllerColors.Accent.copy(alpha = 0.22f) else ControllerColors.Surface2, shape)
+            .background(
+                when {
+                    selected -> ControllerColors.Accent.copy(alpha = 0.22f)
+                    other -> ControllerColors.TextMuted.copy(alpha = 0.18f)
+                    else -> ControllerColors.Surface2
+                },
+                shape
+            )
             .border(
-                if (selected || scanningNow) 2.dp else 1.dp,
+                if (selected || other || scanningNow) 2.dp else 1.dp,
                 when {
                     selected -> ControllerColors.Accent
                     scanningNow -> ControllerColors.Warning
+                    other -> ControllerColors.TextSecondary
                     else -> ControllerColors.Border
                 },
                 shape
@@ -2647,7 +3206,7 @@ private fun LoraChannelTile(
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
-                text = "$ch",
+                text = if (owner != null) "$ch $owner" else "$ch",
                 color = if (ch in ES920_SLOW_CHANNELS) ControllerColors.TextSecondary else ControllerColors.TextPrimary,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Bold,
@@ -2677,7 +3236,8 @@ private data class FieldObject(val id: String, val label: String)
 
 private val FIELD_OBJECTS = listOf(
     FieldObject("baketu", "バケツ"),
-    FieldObject("hata", "旗")
+    FieldObject("hata", "旗"),
+    FieldObject("hoju", "HOJU")
 )
 
 /**
@@ -2725,8 +3285,19 @@ private const val TARGET_LOCK_INTERVAL_MS = 50L
 // LoRa は Wi-Fi が切れている間 200 ms ごとに PC の行を受け取るので、5 回続けて落としたら NG にする。
 private const val LINK_REFRESH_MS = 250L
 // ES920LR のチャンネル（フィールド選択画面で選んだもの）を残す SharedPreferences のキー。
+// 組 A は前からのキー、組 B は "es920_channel_b"。
 private const val PREF_ES920_CHANNEL = "es920_channel"
+private fun es920ChannelPref(link: Int) =
+    if (link == 0) PREF_ES920_CHANNEL else "${PREF_ES920_CHANNEL}_${ES920_LINK_NAMES[link].lowercase()}"
 private const val LINK_WIFI_TIMEOUT_MS = 500L
+// --- 画面ピン留めと USB の許可ダイアログ。ピン留め中はダイアログが出ない。
+// ピン留めはコントローラーの画面に入るときにするので、ふつうはフィールド選択画面で許可を済ませる。
+// コントローラーの画面でモジュールを挿し直したときだけ、ダイアログを出す間ピン留めを外す
+// （ES920LR を挿したら許可を自動で出す USB_DEVICE_ATTACHED は、挿すたびにアプリが開き直されるので 2026-11-06 に外した）。
+// ピン留めを外してからダイアログを出すまで待つ時間 [ms]
+private const val USB_UNPIN_SETTLE_MS = 300L
+// 許可の結果が来てからピン留めし直すまで待つ時間 [ms]。2 台目の許可が続けて来るときに、外し直さずに済むように
+private const val USB_REPIN_DELAY_MS = 2000L
 private const val LINK_LORA_TIMEOUT_MS = 1000L
 
 // ping の宛先と間隔。結果は NETWORK RTT の下に出す。
@@ -2879,11 +3450,18 @@ fun ControllerUI(
     hataTTurnX: Float, hataTTurnY: Float, hataTTurnTheta: Float,
     hataOTurnX: Float, hataOTurnY: Float, hataOTurnTheta: Float,
     hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
+    // 移動バケツの turn と、HOJU の位置決め中に SELECT で idoubake にしているか。
+    idoubakeTurnX: Float, idoubakeTurnY: Float, idoubakeTurnTheta: Float,
+    hojuIdoubake: Boolean,
     bs2TurnX: Float, bs2TurnY: Float, bs2TurnTheta: Float,
     bs3TurnX: Float, bs3TurnY: Float, bs3TurnTheta: Float,
     selectedTurnTarget: TurnTarget,
     t0: Boolean,
     onToggleT0: () -> Unit,
+    // retry を送っている間は true。残りの秒を出し、押せなくする。
+    retry: Boolean,
+    retryRemainingSec: Int,
+    onRetry: () -> Unit,
     left: Boolean, right: Boolean, up: Boolean, down: Boolean,
     circle: Boolean, square: Boolean, cross: Boolean, triangle: Boolean,
     l1: Boolean, l2: Boolean, r1: Boolean, r2: Boolean,
@@ -2904,6 +3482,13 @@ fun ControllerUI(
     speed3: Float,
     onSpeedIncrease: (column: Int) -> Unit,
     onSpeedDecrease: (column: Int) -> Unit,
+    // C1〜C3 をまとめて +/-（どれか 1 つでも端に届いたら、その向きには動かさない）
+    onSpeedAllIncrease: () -> Unit,
+    onSpeedAllDecrease: () -> Unit,
+    // 移動バケツの射出速度の差。HOJU の SPEED ADJUST の DIF の行で +/-（IDOUBAKE_SPEED_DIF_MIN〜MAX）
+    idoubakeSpeedDif: Float,
+    onSpeedDifIncrease: () -> Unit,
+    onSpeedDifDecrease: () -> Unit,
     logList: List<String>,
     hojuState: String,
     t0locked: Boolean,
@@ -2924,8 +3509,9 @@ fun ControllerUI(
     onShowHataAdjustRange: (near: Boolean) -> Unit,
     // 画面の LINK。Wi-Fi が生きているか / LoRa の状態の文字 / LoRa が生きているか。
     linkWifiOk: Boolean,
-    linkLoraText: String,
-    linkLoraOk: Boolean
+    // 組ごと（0 = A、1 = B）
+    linkLoraText: List<String>,
+    linkLoraOk: List<Boolean>
 ) {
     val imageBitmap = ImageBitmap.imageResource(id = R.drawable.blackarrow)
     Box(
@@ -3071,7 +3657,7 @@ fun ControllerUI(
                 Box(
                     modifier = Modifier
                         .width(140.dp)
-                        .height(96.dp)
+                        .height(84.dp)
                         .background(ControllerColors.Background, RoundedCornerShape(5.dp))
                         .border(1.dp, ControllerColors.Border, RoundedCornerShape(5.dp))
                         .padding(5.dp)
@@ -3127,16 +3713,16 @@ fun ControllerUI(
                     )
                 }
 
-                // Wi-Fi / LoRa の生死。入れるぶん SYSTEM LOG の枠を 130dp から縮めてある。
+                // Wi-Fi / LoRa（A / B）の生死。入れるぶん SYSTEM LOG の枠を 130dp から縮めてある（B を足したときに 96 → 84dp）。
                 Box(
                     modifier = Modifier
                         .padding(top = 4.dp)
                         .width(140.dp)
-                        .height(30.dp)
+                        .height(42.dp)
                         .background(ControllerColors.Background, RoundedCornerShape(5.dp))
                         .border(
                             1.dp,
-                            if (linkWifiOk || linkLoraOk) ControllerColors.Border else ControllerColors.Danger,
+                            if (linkWifiOk || linkLoraOk.any { it }) ControllerColors.Border else ControllerColors.Danger,
                             RoundedCornerShape(5.dp)
                         )
                         .padding(horizontal = 5.dp),
@@ -3151,42 +3737,50 @@ fun ControllerUI(
                             fontWeight = FontWeight.Bold,
                             maxLines = 1
                         )
-                        Text(
-                            text = linkLoraText,
-                            color = if (linkLoraOk) ControllerColors.Success else ControllerColors.Danger,
-                            fontSize = 10.sp,
-                            lineHeight = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1
-                        )
+                        linkLoraText.forEachIndexed { i, text ->
+                            Text(
+                                text = text,
+                                color = if (linkLoraOk.getOrElse(i) { false }) ControllerColors.Success else ControllerColors.Danger,
+                                fontSize = 10.sp,
+                                lineHeight = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
             }
         }
 
         // 右上：turn調整パネルと SPEED ADJUST。
-        // 下端の LOW GAIN / レーザー列（約106dp）にかからないよう下に余白を取り、
+        // 下端の LOW GAIN / レーザー列（約94dp）にかからないよう下に余白を取り、
         // 残りの高さを SPEED ADJUST に weight(1f) で全部使わせる。
+        // LOW GAIN を 47dp から 35dp に細くしたぶん、余白を 116dp から縮めた（空いた高さは t0 を大きくするのに使う）。
         Column(
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .padding(1.dp)
                 .width(168.dp)
                 .fillMaxHeight()
-                .padding(bottom = 116.dp),
+                .padding(bottom = 104.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
             horizontalAlignment = Alignment.End
         ) {
-            // 射出速度調整。選択中の OBJECT の column1..3 だけを表示するので3行。
+            // 射出速度調整。選択中の OBJECT の column1..3 だけを表示するので3行（+ まとめて動かす ALL の行）。
             // t0 と入れ替えてカラム先頭。weight(1f) で t0 を除いた残りの高さを使う。
-            val speedAccent = if (selectedSpeed == "hata") ControllerColors.Accent else ControllerColors.Warning
+            val speedAccent = when (selectedSpeed) {
+                "hata" -> ControllerColors.Accent
+                "hoju" -> ControllerColors.Success
+                else -> ControllerColors.Warning
+            }
             // バケツは BS2 / BS3 で速度が別なので、どちらを出しているかを見出しに出す（幅が狭いので「バケツ」の代わり）。
-            // 旗は NEAR（HATA_T / HATA_O / HOJU）/ FAR（それ以外）それぞれ HUTUU / DEKA で速度が別なので、どれを出しているかを見出しに出す
+            // 旗は NEAR（HATA_T / HATA_O）/ FAR（それ以外）それぞれ HUTUU / DEKA で速度が別なので、どれを出しているかを見出しに出す
             // （幅が狭いので「HATA」は付けない）。
-            val speedTargetName = if (selectedSpeed == "hata") {
-                "${if (hataAdjustNear) "NEAR" else "FAR"} ${if (hataDeka) "DEKA" else "HUTUU"}"
-            } else {
-                if (baketuSpeedBs3) "BS3" else "BS2"
+            // HOJU は 1 組だけなので「HOJU」。
+            val speedTargetName = when (selectedSpeed) {
+                "hata" -> "${if (hataAdjustNear) "NEAR" else "FAR"} ${if (hataDeka) "DEKA" else "HUTUU"}"
+                "hoju" -> "HOJU"
+                else -> if (baketuSpeedBs3) "BS3" else "BS2"
             }
             val hataNearInUse = selectedPlace in HATA_NEAR_RANGE_TARGETS
             // 撃つときに使わない方の速度を出している間は、見出しの色で分かるようにする。
@@ -3268,6 +3862,16 @@ fun ControllerUI(
                     verticalArrangement = Arrangement.SpaceEvenly
                 ) {
                     val speedRange = speedRangeFor(selectedSpeed)
+                    // C1〜C3 をまとめて動かす。押しっぱなしの連続調整も 1 本ずつのときと同じ
+                    SpeedAdjustAllRow(
+                        modifier = Modifier.weight(1f),
+                        values = listOf(speed1, speed2, speed3),
+                        range = speedRange,
+                        enabled = settingsSynced,
+                        onIncrease = onSpeedAllIncrease,
+                        onDecrease = onSpeedAllDecrease,
+                        accent = speedAccent
+                    )
                     SpeedAdjustRow(
                         modifier = Modifier.weight(1f),
                         label = "C1",
@@ -3298,15 +3902,61 @@ fun ControllerUI(
                         onDecrease = { onSpeedDecrease(3) },
                         accent = speedAccent
                     )
+                    // HOJU のときだけ、移動バケツの射出速度の差（idoubake_speed_dif）の行を出す。
+                    // idoubake（SELECT）にしている間は色を変える（TURN の IDOUBK の行と同じ）。
+                    if (selectedSpeed == "hoju") {
+                        SpeedAdjustRow(
+                            modifier = Modifier.weight(1f),
+                            label = "DIF",
+                            value = idoubakeSpeedDif,
+                            range = IDOUBAKE_SPEED_DIF_MIN..IDOUBAKE_SPEED_DIF_MAX,
+                            enabled = settingsSynced,
+                            onIncrease = onSpeedDifIncrease,
+                            onDecrease = onSpeedDifDecrease,
+                            accent = if (hojuIdoubake) ControllerColors.Warning else speedAccent
+                        )
+                    }
                 }
             }
 
-            // t0（SPEED ADJUST と入れ替えてカラム下端へ）
+            // 下端の列: retry と t0（SPEED ADJUST と入れ替えてカラム下端へ）。retry は t0 の左。
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+            // retry: 押すと RETRY_HOLD_SECONDS の間 true を送る。その間は押せず、残りの秒を出す。
+            Button(
+                onClick = onRetry,
+                enabled = !retry,
+                contentPadding = PaddingValues(0.dp),
+                modifier = Modifier
+                    .size(72.dp)
+                    .border(1.dp, if (retry) ControllerColors.Warning else ControllerColors.Border, androidx.compose.foundation.shape.CircleShape),
+                shape = androidx.compose.foundation.shape.CircleShape,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = ControllerColors.Surface2,
+                    // 送っている間（押せない間）も暗くせず、送っていることが分かる色にする
+                    disabledContainerColor = Color(0xFF4D3A12)
+                ),
+                elevation = ButtonDefaults.buttonElevation(0.dp)
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("RETRY", fontWeight = FontWeight.Bold, fontSize = 13.sp,
+                        color = if (retry) ControllerColors.Warning else ControllerColors.TextPrimary)
+                    if (retry) {
+                        Text("$retryRemainingSec", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = ControllerColors.Warning)
+                    }
+                }
+            }
+            // t0
+            // SPEED ADJUST の +/- を大きくするため 80dp から 60dp に縮め、LOW GAIN を細くした分で 72dp に戻した。
             Button(
                 onClick = onToggleT0,
                 enabled = !t0locked,
+                // 小さくした円に "OFF" が収まるよう、ボタンの内側の余白はなくす。
+                contentPadding = PaddingValues(0.dp),
                 modifier = Modifier
-                    .size(80.dp)
+                    .size(72.dp)
                     .border(1.dp, if (t0) ControllerColors.Success else ControllerColors.Danger, androidx.compose.foundation.shape.CircleShape),
                 shape = androidx.compose.foundation.shape.CircleShape,
                 colors = ButtonDefaults.buttonColors(
@@ -3316,9 +3966,10 @@ fun ControllerUI(
             ) {
                 Text(if (t0) "ON" else "OFF", fontWeight = FontWeight.Bold, color = ControllerColors.TextPrimary)
             }
+            }
         }
 
-        // 物体選択（バケツ / 旗）2択排他。
+        // 物体選択（バケツ / 旗 / HOJU）3択排他。
         // 常に1つ点灯して "object" を送り続ける。
         HudPanel(
             modifier = Modifier
@@ -3328,19 +3979,21 @@ fun ControllerUI(
             contentPadding = 4.dp
         ) {
             HudSectionTitle("SPEED  /  ${objectDisplayName(selectedSpeed)}", ControllerColors.Accent, 12.sp)
-            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            // HOJU を足して 3 つにしたので、下の TURN ADJUST にかからないようボタンを低くして間隔を詰めてある。
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 FIELD_OBJECTS.forEach { fieldObject ->
-                    // 旗とバケツは撃つときに使う組も出す。OBJECT が旗でなくても × で切り替わるので常に出す。
+                    // 旗とバケツは撃つときに使う組も出す。OBJECT が旗でなくても × で切り替わるので常に出す。HOJU は 1 組だけ。
                     val isHata = fieldObject.id == "hata"
                     ObjectSelectButton(
-                        label = if (isHata) {
-                            "${fieldObject.label} ${if (selectedPlace in HATA_NEAR_RANGE_TARGETS) "NEAR" else "FAR"} ${if (hataDeka) "DEKA" else "HUTUU"}"
-                        } else {
-                            "${fieldObject.label} ${if (baketuBs3) "BS3" else "BS2"}"
+                        label = when (fieldObject.id) {
+                            "hata" -> "${fieldObject.label} ${if (selectedPlace in HATA_NEAR_RANGE_TARGETS) "NEAR" else "FAR"} ${if (hataDeka) "DEKA" else "HUTUU"}"
+                            "baketu" -> "${fieldObject.label} ${if (baketuBs3) "BS3" else "BS2"}"
+                            else -> fieldObject.label
                         },
                         selected = selectedSpeed == fieldObject.id,
                         onClick = { onSelectObject(fieldObject.id) },
-                        fontSize = if (isHata) 10.sp else 12.sp
+                        fontSize = if (isHata) 10.sp else 12.sp,
+                        height = 34.dp
                     )
                 }
             }
@@ -3353,10 +4006,11 @@ fun ControllerUI(
                 .offset(498.dp, 163.dp),
             accent = ControllerColors.Warning,
             // 下の hojustate 表示にかからないよう余白を詰めて少し上げてある。
+            // 2026-11-07 に IDOUBK の行を足した（位置は変えていない。下に 1 行ぶん伸びる）。
             contentPadding = 4.dp
         ) {
             HudSectionTitle(
-                if (settingsSynced) "TURN ADJUST  /  ${selectedTurnTarget.displayName(hataAdjustNear, hataO)}" else "TURN ADJUST  /  SYNC...",
+                if (settingsSynced) "TURN ADJUST  /  ${selectedTurnTarget.displayName(hataAdjustNear, hataO, hojuIdoubake)}" else "TURN ADJUST  /  SYNC...",
                 if (settingsSynced) ControllerColors.Warning else ControllerColors.Danger,
                 10.sp
             )
@@ -3368,6 +4022,12 @@ fun ControllerUI(
                 Text("HATA_T X ${"%.2f".format(hataTTurnX)} Y ${"%.2f".format(hataTTurnY)} T ${"%.2f".format(hataTTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
                 Text("HATA_O X ${"%.2f".format(hataOTurnX)} Y ${"%.2f".format(hataOTurnY)} T ${"%.2f".format(hataOTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
                 Text("HOJU   X ${"%.2f".format(hojuTurnX)} Y ${"%.2f".format(hojuTurnY)} T ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
+                // 移動バケツの turn。HOJU の位置決め中に SELECT で idoubake にしている間は色を変える（TURN ADJUST が動かすのはこの行）。
+                Text(
+                    "IDOUBK X ${"%.2f".format(idoubakeTurnX)} Y ${"%.2f".format(idoubakeTurnY)} T ${"%.2f".format(idoubakeTurnTheta)}",
+                    color = if (hojuIdoubake) ControllerColors.Warning else ControllerColors.TextPrimary,
+                    fontSize = 8.sp
+                )
             }
         }
 
@@ -3404,8 +4064,9 @@ fun ControllerUI(
                 modifier = Modifier.width(180.dp),
                 containerColor = if (lowGain) Color(0xFF124D37) else ControllerColors.Surface2,
                 contentColor = if (lowGain) ControllerColors.Success else ControllerColors.TextSecondary,
-                height = 47.dp,
-                fontSize = 17.sp,
+                // 右上の列（t0）に高さを回すため 47dp から細くした。
+                height = 35.dp,
+                fontSize = 15.sp,
                 accent = if (lowGain) ControllerColors.Success else ControllerColors.Border
             )
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -3435,13 +4096,13 @@ fun ControllerUI(
 }
 
 /** TURN ADJUST の見出し。旗は調整している方（HATA_T / HATA_O / FAR）も出す。 */
-fun TurnTarget.displayName(hataNear: Boolean, hataO: Boolean): String = when (this) {
+fun TurnTarget.displayName(hataNear: Boolean, hataO: Boolean, hojuIdoubake: Boolean = false): String = when (this) {
     TurnTarget.HATA -> when {
         !hataNear -> "HATA FAR"
         hataO -> "HATA_O"
         else -> "HATA_T"
     }
-    TurnTarget.HOJU -> "HOJU"
+    TurnTarget.HOJU -> if (hojuIdoubake) "HOJU (IDOUBAKE)" else "HOJU"
     TurnTarget.BS2 -> "BS2"
     TurnTarget.BS3 -> "BS3"
 }
@@ -3460,7 +4121,8 @@ private fun ObjectSelectButton(
     label: String,
     selected: Boolean,
     onClick: () -> Unit,
-    fontSize: androidx.compose.ui.unit.TextUnit = 14.sp
+    fontSize: androidx.compose.ui.unit.TextUnit = 14.sp,
+    height: androidx.compose.ui.unit.Dp = 40.dp
 ) {
     HudButton(
         text = if (selected) "▶  $label" else label,
@@ -3468,7 +4130,7 @@ private fun ObjectSelectButton(
         modifier = Modifier.fillMaxWidth(),
         containerColor = if (selected) Color(0xFF123B4A) else ControllerColors.Surface2,
         contentColor = if (selected) ControllerColors.Accent else ControllerColors.TextSecondary,
-        height = 40.dp,
+        height = height,
         fontSize = fontSize,
         accent = if (selected) ControllerColors.Accent else ControllerColors.Border
     )

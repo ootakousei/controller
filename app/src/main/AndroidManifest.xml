@@ -28,13 +28,25 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
-        <!-- ES920LR を挿したとき、許可ダイアログなしでこのアプリに許可を出す（画面ピン留めと重ならないように） -->
-        <intent-filter>
-            <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
-        </intent-filter>
-        <meta-data
-            android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
-            android:resource="@xml/usb_device_filter" />
+        <!-- ES920LR を挿したときにアプリを開く設定（USB_DEVICE_ATTACHED）は 2026-11-06 にここから外した。
+             挿すたびにアプリが開き直されていたため。2026-11-08 から下の UsbAttachActivity で受ける -->
+        </activity>
+        <!-- ES920LR を挿したとき、許可ダイアログなしでこのアプリに許可を出す（2026-11-08）。
+             初めて挿したときの確認で「常に」を選ぶと、次から Android が挿すたびに許可を出してからこれを開く。
+             これは画面を持たずにすぐ閉じる。別のタスクにして、MainActivity（singleInstance）を開き直さない -->
+        <activity
+            android:name=".UsbAttachActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="com.example.controller.usbattach"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
         </activity>
     </application>
 
