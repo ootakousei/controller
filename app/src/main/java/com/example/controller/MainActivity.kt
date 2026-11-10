@@ -213,7 +213,7 @@ private val PACKET_TARGET_IDS = listOf(
 //    9      i32   theta × POSE_THETA_SCALE（rad）
 //   13      u8    bit i = PC が ES920LR の組 i（bit0 = A、bit1 = B）の行を受け取れている
 //                 （画面の LoRa の生死。Wi-Fi が生きている間はこれで見る）
-//   14      u8    invalid_target の番号（ES920LR の状態の行の番号と比べ、Wi-Fi で処理済みの分を二重に扱わないため）
+//   14      u8    invalid_target の番号（進んでいたら MOVE TARGET を解除する。onInvalidSeq）
 private const val POSE_PACKET_VERSION: Byte = 2
 private const val POSE_PACKET_SIZE = 15
 private const val POSE_XY_SCALE = 100.0        // 0.01mm 刻み
@@ -284,7 +284,7 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var lastPoseNanos = 0L
 
-    // ES920LR は 2 組（A / B）を別々のチャンネルで同時に使う（Es920Link.kt の ES920_LINK_COUNT）。
+    // ES920LR の組の数は Es920Link.kt の ES920_LINK_COUNT で決まる（2026-11-09〜 組 A だけ）。
     private val es920: Es920Group by lazy {
         Es920Group(
             this, ::appendLog, ::applyLoraSettings,
@@ -372,10 +372,16 @@ class MainActivity : ComponentActivity() {
     // bit i が組 i（bit0 = A、bit1 = B）。
     @Volatile
     private var pcHearsLora = 0
-    // 最後に知った invalid_target の番号（-1 はまだ知らない）。UDP の自己位置で追いかけ、
-    // ES920LR の状態の行で番号が進んでいたら MOVE TARGET を解除する（Wi-Fi のときはログの invalid_target で解除する）。
-    @Volatile
-    private var lastInvalidSeq = -1
+    // invalid_target の番号。UDP の自己位置と ES920LR の状態の行のどちらかで番号が進んでいたら MOVE TARGET を解除する。
+    // /log の行は落ちても送り直さないので、解除には使わない（2026-11-09）。
+    private val invalidSeq = InvalidSeqTracker()
+
+    /** invalid_target の番号が届いた。IO スレッドから呼ぶ。 */
+    private fun onInvalidSeq(seq: Int) {
+        if (invalidSeq.update(seq, SystemClock.elapsedRealtime())) {
+            runOnUiThread { clearMoveTarget() }
+        }
+    }
 
     // 画面の LINK の表示（LINK_REFRESH_MS ごとに作り直す）。
     private var linkWifiOk by mutableStateOf(false)
@@ -519,6 +525,9 @@ class MainActivity : ComponentActivity() {
     // turn???1????????
     private val turnXYStep = 2f
     private val turnThetaStep = 0.1f
+    // 移動バケツの turn x / y は 1 回で 100 mm（PC の drive2 が狙う点（相手のバケツ）をこれだけ動かす。2026-11-10）。
+    // 範囲はアプリでは止めない（PC が狙う点を 0〜1000 にクランプする。送るのは ±3276.7 まで）。
+    private val idoubakeTurnXYStep = 100f
     private var prevDpadLeft = false
     private var prevDpadRight = false
     private var prevDpadUp = false
@@ -1069,8 +1078,9 @@ class MainActivity : ComponentActivity() {
         hoju_turnx = f("hoju_turnx", hoju_turnx)
         hoju_turny = f("hoju_turny", hoju_turny)
         hoju_turntheta = f("hoju_turntheta", hoju_turntheta)
-        idoubake_turnx = f("idoubake_turnx", idoubake_turnx)
-        idoubake_turny = f("idoubake_turny", idoubake_turny)
+        // 移動バケツの turn x / y は起動時に 0 から始める（con.py も 0 を送る。届いた値は使わない。2026-11-10）
+        idoubake_turnx = 0.0f
+        idoubake_turny = 0.0f
         idoubake_turntheta = f("idoubake_turntheta", idoubake_turntheta)
         idoubakeSpeedDif = f("idoubake_speed_dif", idoubakeSpeedDif)
         // bs2 / bs3_turn* がまだ無い（共通の baketu_turn* だった頃の）設定値なら、baketu_turn* を引き継ぐ。
@@ -1142,7 +1152,7 @@ class MainActivity : ComponentActivity() {
      * Wi-Fi で /log と自己位置が届いているときと同じことをする。IO スレッドから呼ばれる。
      * Wi-Fi の生死は UDP だけで見るので、lastPoseNanos は更新しない。
      */
-    private fun applyLoraStatus(data: ByteArray, hoju: String, invalidSeq: Int) {
+    private fun applyLoraStatus(data: ByteArray, hoju: String, invalidSeqValue: Int) {
         if (data.size != POSE_PACKET_SIZE || data[0] != POSE_PACKET_VERSION) return
         val pose = ByteBuffer.wrap(data, 1, POSE_PACKET_SIZE - 1).order(ByteOrder.LITTLE_ENDIAN)
         val x = pose.int / POSE_XY_SCALE
@@ -1153,11 +1163,8 @@ class MainActivity : ComponentActivity() {
             posY = y
             posTheta = theta
             if (hoju.isNotBlank()) hojuState = hoju
-            // invalid_target の番号が進んでいたら、ロボットが移動先を受け付けなかったので解除する（Wi-Fi のときと同じ）。
-            val last = lastInvalidSeq
-            lastInvalidSeq = invalidSeq
-            if (last >= 0 && last != invalidSeq) clearMoveTarget()
         }
+        onInvalidSeq(invalidSeqValue)
     }
 
     /** ES920LR で届いたログの 1 行（hojustate 以外の /log）を SYSTEM LOG に出す。IO スレッドから呼ばれる。 */
@@ -1219,8 +1226,9 @@ class MainActivity : ComponentActivity() {
         hoju_turnx = loadSideFloat(mapId, "hoju_turnx", 0.0f)
         hoju_turny = loadSideFloat(mapId, "hoju_turny", 0.0f)
         hoju_turntheta = loadSideFloat(mapId, "hoju_turntheta", 0.0f)
-        idoubake_turnx = loadSideFloat(mapId, "idoubake_turnx", 0.0f)
-        idoubake_turny = loadSideFloat(mapId, "idoubake_turny", 0.0f)
+        // 移動バケツの turn x / y は保存した値から戻さず 0 から始める（狙う点を動かす量。2026-11-10）。theta は今までどおり戻す
+        idoubake_turnx = 0.0f
+        idoubake_turny = 0.0f
         idoubake_turntheta = loadSideFloat(mapId, "idoubake_turntheta", 0.0f)
         idoubakeSpeedDif = loadSideFloat(mapId, "idoubake_speed_dif", 0.0f)
         // bs2 / bs3_turn* の保存値が無ければ、共通だった頃の baketu_turn* を引き継ぐ（baketu は saveSettings で消す）。
@@ -1830,7 +1838,7 @@ class MainActivity : ComponentActivity() {
                     posY = pose.int / POSE_XY_SCALE
                     posTheta = pose.int / POSE_THETA_SCALE
                     pcHearsLora = pose.get().toInt() and 0xFF
-                    lastInvalidSeq = pose.get().toInt() and 0xFF
+                    onInvalidSeq(pose.get().toInt() and 0xFF)
                     lastPoseNanos = System.nanoTime()
                 } else {
                     appendLog("RECV ERROR: unknown pose packet (len=${packet.length})")
@@ -1874,16 +1882,13 @@ class MainActivity : ComponentActivity() {
                 if (receivedLog.isNotBlank() && !receivedLog.equals("none", ignoreCase = true)) {
                     val normalLines = mutableListOf<String>()
                     var latestHojuState: String? = null
-                    var invalidTarget = false
 
                     receivedLog.split("\n")
                         .map { it.trim() }
                         .filter { it.isNotBlank() && !it.equals("none", ignoreCase = true) }
                         .forEach { line ->
-                            // ロボットが移動先を受け付けなかった合図。ログにも残す。
-                            if (line.contains("invalid_target", ignoreCase = true)) {
-                                invalidTarget = true
-                            }
+                            // invalid_target の行はログに出すだけ。MOVE TARGET の解除は番号で決める（onInvalidSeq）。
+                            // ここでも解除すると、遅れて届いた行が選び直した移動先を消してしまう。
                             if (line.startsWith("hojustate:")) {
                                 // 画面には "hojustate:" を外した中身だけを出す。
                                 // hojustate???UI????SYSTEM LOG???????
@@ -1893,10 +1898,8 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                    if (latestHojuState != null || normalLines.isNotEmpty() || invalidTarget) {
+                    if (latestHojuState != null || normalLines.isNotEmpty()) {
                         runOnUiThread {
-                            // invalid_target が来たら、何を選んでいても MOVE TARGET を解除する。
-                            if (invalidTarget) clearMoveTarget()
                             latestHojuState?.let { hojuState = it }
                             if (normalLines.isNotEmpty()) {
                                 logList = (logList + normalLines).takeLast(50)
@@ -2094,9 +2097,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
             // idoubake の間は、ロボットが使っている idoubake turn を動かす。
+            // x / y は狙う点を動かす量で、1 回 idoubakeTurnXYStep（100 mm）。theta はほかの turn と同じ刻み。
             TurnTarget.HOJU -> if (hojuIdoubake) {
-                idoubake_turnx = xy(idoubake_turnx, dx)
-                idoubake_turny = xy(idoubake_turny, dy)
+                idoubake_turnx = xy(idoubake_turnx, Math.signum(dx) * idoubakeTurnXYStep)
+                idoubake_turny = xy(idoubake_turny, Math.signum(dy) * idoubakeTurnXYStep)
                 idoubake_turntheta = theta(idoubake_turntheta, dtheta)
             } else {
                 hoju_turnx = xy(hoju_turnx, dx)

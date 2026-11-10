@@ -50,7 +50,10 @@ private enum class Es920Protocol { LORA, FSK }
 // ★ LoRa / FSK の切り替え。PC 側 es920lr.yaml の protocol と必ずそろえる。
 private val ES920_PROTOCOL = Es920Protocol.LORA
 
-// --- 2 組を並べて使う（2026-11-06〜）。スマホに 2 台、PC に 2 台挿し、組ごとに別のチャンネルで同時に送る。
+// --- 2026-11-09〜 組 A だけで使う（スマホに 1 台、PC に 1 台）。2 組に戻すなら下の 3 つの定数と、PC の
+//   202689master.py の ES920LR_LINKS、con.py の LORA_LINKS をそろえて戻す（COUNT = 2、NAMES = A, B、CHANNELS = 10, 16）。
+//   2 組のまま 1 台ずつ挿すと、スマホと PC で別の組を取って通信できないことがあるので、台数と組の数は必ずそろえる。
+// --- 以下は 2 組を並べて使うときの説明（2026-11-06〜）。スマホに 2 台、PC に 2 台挿し、組ごとに別のチャンネルで同時に送る。
 //   組 A: スマホ 0000 → PC 0001（前からの組）、組 B: スマホ 0002 → PC 0003。PAN ID は同じ。
 //   PC 側は es920lr ノードを 2 つ動かす（B は名前空間 es920lr_b。ownid / dstid は launch で入れる）。
 //   PC のノードは送り元 ID が相手のものだけを受け取るので、探しているときに別の組の行を拾っても止まらない。
@@ -59,12 +62,12 @@ private val ES920_PROTOCOL = Es920Protocol.LORA
 //   con.py は両方を受け取り、今までどおり番号が新しいものだけを使う（同じ番号の 2 つ目は捨てる）。
 //   同じ番号は 2 組で中身もそろえる（短い押しを足すかどうかも同じ。Es920Group.pressedFor）。
 //   どのモジュールがどの組かは決めていない。空いているモジュールを開き、起動のたびに組の ID を書き込む。
-const val ES920_LINK_COUNT = 2
-val ES920_LINK_NAMES = listOf("A", "B")
+const val ES920_LINK_COUNT = 1
+val ES920_LINK_NAMES = listOf("A")
 // チャンネルの既定値（まだ画面で選んでいないとき）。PC 側の launch の channel と同じにしておくと、すぐ届く。
 // LoRa 250kHz と FSK 100 / 150kbps はどちらも 1〜19 で、10 = 924.3 MHz（同じ周波数）。
 // 2 台のモジュールはスマホの上で数 cm しか離れていないので、片方の送信がもう片方の受信を邪魔しないよう離しておく。
-val ES920_DEFAULT_CHANNELS = listOf(10, 16)
+val ES920_DEFAULT_CHANNELS = listOf(10)
 // 2 組のチャンネルがこれより近いと、画面で注意を出す（同じチャンネルは選べない）。
 const val ES920_MIN_CHANNEL_GAP = 3
 /** 組の自分の ID（スマホ側）。A: 0000、B: 0002。 */
