@@ -157,12 +157,13 @@ private class SendPath(val name: String, val network: Network, val socket: Datag
     }
 }
 
-// ロボットへ送るバイナリパケット（リトルエンディアン、101 byte）。並びは send() を参照。
+// ロボットへ送るバイナリパケット（リトルエンディアン、107 byte）。並びは send() を参照。
 // con.py の decode_packet() と必ず合わせること。
-// 2026-11-08 に version 18。idoubake_speed_dif（i16）を 98 byte 目に足し、100 byte 目は空き（0）。
-// 設定値（14〜100 byte）を 87 byte にして、ES920LR の LoRa で 29 byte × 3 回に割り切れるようにするため。
-private const val PACKET_VERSION: Byte = 18
-private const val PACKET_SIZE = 101
+// 2026-11-08 に version 18。idoubake_speed_dif（i16）を 98 byte 目に足した。
+// 2026-11-11 に version 19。移動バケツのティア2 の turn x / y・DIF（i16 × 3）を 100 byte 目に足し、106 byte 目は空き（0）。
+// 設定値（14〜106 byte）を 93 byte にして、ES920LR の LoRa で 31 byte × 3 回に割り切れるようにするため。
+private const val PACKET_VERSION: Byte = 19
+private const val PACKET_SIZE = 107
 
 // float は「値 × 倍率」を四捨五入して int16 で送る（con.py の STICK_SCALE / SETTING_SCALES と合わせる）。
 // 整数で送るので、con.py 側で割り戻しても 0.30000001 のように桁が伸びない。
@@ -188,6 +189,7 @@ private val SETTING_SCALES = listOf(
     "hoju_speed1" to SPEED_SCALE, "hoju_speed2" to SPEED_SCALE, "hoju_speed3" to SPEED_SCALE,
     "idoubake_turnx" to TURN_XY_SCALE, "idoubake_turny" to TURN_XY_SCALE, "idoubake_turntheta" to TURN_THETA_SCALE,
     "idoubake_speed_dif" to SPEED_SCALE,
+    "idoubake2_turnx" to TURN_XY_SCALE, "idoubake2_turny" to TURN_XY_SCALE, "idoubake2_speed_dif" to SPEED_SCALE,
 )
 
 // 文字列の id は、この並びの番号（u8）で送る。並びにない id は 0xFF。
@@ -225,15 +227,16 @@ private const val POSE_THETA_SCALE = 10000.0   // 0.0001rad 刻み
 //   （ロボットの地図は赤で y が反転しているため）。z = バケツの底の床からの高さ（ロボットは z + 250 = 口を狙う）。
 //   2026-11-08 に移動バケツ位置決めの仕様（kazusa_notes/mag_pc/2026-11-08_idoubake_spec.md）に合わせた。
 //   ロボットは launch のときに 1 回だけ使う（con.py → launch_starter → drive2）。起動したあとに変えても次に起動し直すまで効かない。
-//   上り（8 バイト）: 0 u8 ENEMY_TAG / 1 i16 x / 3 i16 y / 5 i16 z / 7 u8 1〜6 バイトの和の下位 8 bit
+//   2026-11-11 からティア1 / ティア2 の 2 組（x1 y1 z1 x2 y2 z2）を 1 つのパケットで送る。ティア2 も必ず送る。
+//   上り（14 バイト）: 0 u8 ENEMY_TAG / 1 i16 x1 y1 z1 x2 y2 z2 / 13 u8 1〜12 バイトの和の下位 8 bit
 //     UDP ではこのまま 5005 番へ。ES920LR では操作だけの行の後ろに付ける（Es920Link.kt の LORA_ENEMY_*）。
-//   PC の返事（UDP、9 バイト）: 0 u8 ENEMY_TAG / 1 u8 has / 2 i16 x / 4 i16 y / 6 i16 z / 8 u8 1〜7 バイトの和の下位 8 bit
-//     ES920LR では状態の行に同じ値（has / x / y / z）が入る。
+//   PC の返事（UDP、15 バイト）: 0 u8 ENEMY_TAG / 1 u8 has / 2 i16 x1 y1 z1 x2 y2 z2 / 14 u8 1〜13 バイトの和の下位 8 bit
+//     ES920LR では状態の行に同じ値（has / 6 つの値）が入る。自己位置の返事も 15 バイトだが、先頭のバイトで見分ける。
 //   PC が今持っている値が返ってくるので、自分の値と同じなら届いた（番号は使わない）。
 //   届くまで ENEMY_RESEND_MS ごとに送り直し続け、届いてからも ENEMY_CHECK_MS ごとに送って確かめる。
 private const val ENEMY_TAG: Byte = 0x45
-private const val ENEMY_UP_SIZE = 8
-private const val ENEMY_ACK_SIZE = 9
+private const val ENEMY_UP_SIZE = 14
+private const val ENEMY_ACK_SIZE = 15
 private const val ENEMY_RESEND_MS = 300L
 private const val ENEMY_CHECK_MS = 5000L
 // +/- 1 回の量と範囲 [mm]（con.py の ENEMY_*_RANGE と同じ）
@@ -436,17 +439,24 @@ class MainActivity : ComponentActivity() {
     private var idoubake_turnx by mutableStateOf(0.0f)
     private var idoubake_turny by mutableStateOf(0.0f)
     private var idoubake_turntheta by mutableStateOf(0.0f)
+    // ティア2 の turn x / y（2026-11-11）。上の idoubake_turnx / y はティア1 用で、theta は 2 つのティアで共通。
+    private var idoubake2_turnx by mutableStateOf(0.0f)
+    private var idoubake2_turny by mutableStateOf(0.0f)
     // 移動バケツ中か。true の間、TURN ADJUST は hoju turn の代わりに idoubake turn を動かす。
     // 2026-11-08 から、ロボットの drive2 と同じ規則で決める（drive2 は bit21 を見ず、SELECT と前後のスティックから自分で決める）:
     //   入る: 移動先 HOJU を選んでいる間に SELECT を押した（前後のスティックを倒していないときだけ。パスの途中でもよい。
-    //         drive2 はパスの途中なら覚えておき、hoju に着いたら移動バケツにする）。もう一度押しても何もしない
+    //         drive2 はパスの途中なら覚えておき、hoju に着いたら移動バケツにする）。入っている間に押すとティアを入れ替える（idoubakeTier）
     //   出る: 前後のスティックを倒した（onGenericMotionEvent）、移動先を選び直した / 解除した（applyMoveTarget / clearMoveTarget）、
     //         ロボットの invalid_target（clearMoveTarget）
     // 移動先（place）を増やすのではない。con.py へはボタン類の bit21 で送る（PC は使わない）。
     private var hojuIdoubake by mutableStateOf(false)
+    // 今狙っているティア（1 か 2。2026-11-11）。入るときはいつも 1、移動バケツ中に SELECT を押すたびに入れ替え、出たら 1 に戻す（drive2 と同じ規則）。
+    private var idoubakeTier by mutableStateOf(1)
     // 移動バケツを狙うときの射出速度の差（2026-11-08 追加）。SPEED ADJUST の HOJU の DIF の行で動かす。
     // con.py へは設定値として送り、保存もする（ほかの turn / speed と同じ）。移動バケツ中の射出速度に足される。
     private var idoubakeSpeedDif by mutableStateOf(0.0f)
+    // ティア2 の射出速度の差（2026-11-11）。上の idoubakeSpeedDif はティア1 用。
+    private var idoubake2SpeedDif by mutableStateOf(0.0f)
 
     // 相手のバケツの位置 [mm]（ENEMY_* の説明）。フィールド選択画面の +/- で選ぶ。スマホの中に保存して持つ（loadEnemy / changeEnemy）。
     // PC と同期していなくても（届いていなくても、PC が別の値を持っていても）この値を使い続け、PC の値で上書きしない。
@@ -454,11 +464,15 @@ class MainActivity : ComponentActivity() {
     private var enemyX by mutableStateOf(ENEMY_DEFAULT_X)
     private var enemyY by mutableStateOf(ENEMY_DEFAULT_Y)
     private var enemyZ by mutableStateOf(ENEMY_DEFAULT_Z)
+    // ティア2 の相手のバケツの位置（2026-11-11）
+    private var enemy2X by mutableStateOf(ENEMY_DEFAULT_X)
+    private var enemy2Y by mutableStateOf(ENEMY_DEFAULT_Y)
+    private var enemy2Z by mutableStateOf(ENEMY_DEFAULT_Z)
     // PC が持っていると返してきた値（UDP の返事か ES920LR の状態の行）。null は PC が持っていない / まだ返事が無い。
     private var enemyAck by mutableStateOf<List<Int>?>(null)
     // PC に今の値が届いているか
     private val enemyConfirmed: Boolean
-        get() = enemyAck == listOf(enemyX, enemyY, enemyZ)
+        get() = enemyAck == listOf(enemyX, enemyY, enemyZ, enemy2X, enemy2Y, enemy2Z)
     // 最後に UDP で送った時刻（SystemClock.elapsedRealtime）。値を変えたら 0 にしてすぐ送る
     @Volatile
     private var enemyLastSentMs = 0L
@@ -812,6 +826,7 @@ class MainActivity : ComponentActivity() {
             // 前後のスティックを倒したら移動バケツを解除する（ロボットの drive2 と同じ規則。hojuIdoubake の説明）
             if (hojuIdoubake && hojuLineStickTilted()) {
                 hojuIdoubake = false
+                idoubakeTier = 1
                 appendLog("HOJU TURN: HOJU (stick)")
             }
 
@@ -1081,8 +1096,11 @@ class MainActivity : ComponentActivity() {
         // 移動バケツの turn x / y は起動時に 0 から始める（con.py も 0 を送る。届いた値は使わない。2026-11-10）
         idoubake_turnx = 0.0f
         idoubake_turny = 0.0f
+        idoubake2_turnx = 0.0f
+        idoubake2_turny = 0.0f
         idoubake_turntheta = f("idoubake_turntheta", idoubake_turntheta)
         idoubakeSpeedDif = f("idoubake_speed_dif", idoubakeSpeedDif)
+        idoubake2SpeedDif = f("idoubake2_speed_dif", idoubake2SpeedDif)
         // bs2 / bs3_turn* がまだ無い（共通の baketu_turn* だった頃の）設定値なら、baketu_turn* を引き継ぐ。
         bs2_turnx = f("bs2_turnx", f("baketu_turnx", bs2_turnx))
         bs2_turny = f("bs2_turny", f("baketu_turny", bs2_turny))
@@ -1229,8 +1247,11 @@ class MainActivity : ComponentActivity() {
         // 移動バケツの turn x / y は保存した値から戻さず 0 から始める（狙う点を動かす量。2026-11-10）。theta は今までどおり戻す
         idoubake_turnx = 0.0f
         idoubake_turny = 0.0f
+        idoubake2_turnx = 0.0f
+        idoubake2_turny = 0.0f
         idoubake_turntheta = loadSideFloat(mapId, "idoubake_turntheta", 0.0f)
         idoubakeSpeedDif = loadSideFloat(mapId, "idoubake_speed_dif", 0.0f)
+        idoubake2SpeedDif = loadSideFloat(mapId, "idoubake2_speed_dif", 0.0f)
         // bs2 / bs3_turn* の保存値が無ければ、共通だった頃の baketu_turn* を引き継ぐ（baketu は saveSettings で消す）。
         val baketuTurnX = loadSideFloat(mapId, "baketu_turnx", 0.0f)
         val baketuTurnY = loadSideFloat(mapId, "baketu_turny", 0.0f)
@@ -1320,6 +1341,9 @@ class MainActivity : ComponentActivity() {
             .putFloat("${mapId}_idoubake_turny", idoubake_turny)
             .putFloat("${mapId}_idoubake_turntheta", idoubake_turntheta)
             .putFloat("${mapId}_idoubake_speed_dif", idoubakeSpeedDif)
+            .putFloat("${mapId}_idoubake2_turnx", idoubake2_turnx)
+            .putFloat("${mapId}_idoubake2_turny", idoubake2_turny)
+            .putFloat("${mapId}_idoubake2_speed_dif", idoubake2SpeedDif)
             .putFloat("${mapId}_bs2_turnx", bs2_turnx)
             .putFloat("${mapId}_bs2_turny", bs2_turny)
             .putFloat("${mapId}_bs2_turntheta", bs2_turntheta)
@@ -1446,6 +1470,7 @@ class MainActivity : ComponentActivity() {
                 ScreenState.TEAM_SELECTION -> {
                     TeamSelectionScreen(
                         enemyX = enemyX, enemyY = enemyY, enemyZ = enemyZ,
+                        enemy2X = enemy2X, enemy2Y = enemy2Y, enemy2Z = enemy2Z,
                         enemyConfirmed = enemyConfirmed,
                         onEnemyChange = ::changeEnemy,
                         isFlipped = isFlipped,
@@ -1503,7 +1528,9 @@ class MainActivity : ComponentActivity() {
                         hataOTurnX = hata_o_turnx, hataOTurnY = hata_o_turny, hataOTurnTheta = hata_o_turntheta,
                         hojuTurnX = hoju_turnx, hojuTurnY = hoju_turny, hojuTurnTheta = hoju_turntheta,
                         idoubakeTurnX = idoubake_turnx, idoubakeTurnY = idoubake_turny, idoubakeTurnTheta = idoubake_turntheta,
+                        idoubake2TurnX = idoubake2_turnx, idoubake2TurnY = idoubake2_turny,
                         hojuIdoubake = hojuIdoubake,
+                        idoubakeTier = idoubakeTier,
                         bs2TurnX = bs2_turnx, bs2TurnY = bs2_turny, bs2TurnTheta = bs2_turntheta,
                         bs3TurnX = bs3_turnx, bs3TurnY = bs3_turny, bs3TurnTheta = bs3_turntheta,
                         selectedTurnTarget = selectedTurnTarget,
@@ -1540,6 +1567,9 @@ class MainActivity : ComponentActivity() {
                         idoubakeSpeedDif = idoubakeSpeedDif,
                         onSpeedDifIncrease = { adjustIdoubakeSpeedDif(speedStep) },
                         onSpeedDifDecrease = { adjustIdoubakeSpeedDif(-speedStep) },
+                        idoubake2SpeedDif = idoubake2SpeedDif,
+                        onSpeedDif2Increase = { adjustIdoubake2SpeedDif(speedStep) },
+                        onSpeedDif2Decrease = { adjustIdoubake2SpeedDif(-speedStep) },
                         logList = logList,
                         hojuState = hojuState,
                         t0locked = t0Locked,
@@ -1711,6 +1741,7 @@ class MainActivity : ComponentActivity() {
                     hojuSpeed1, hojuSpeed2, hojuSpeed3,
                     idoubake_turnx, idoubake_turny, idoubake_turntheta, hojuIdoubake,
                     idoubakeSpeedDif,
+                    idoubake2_turnx, idoubake2_turny, idoubake2SpeedDif,
                     packetObject(), selectedPlace,
                     hataLaser, hojuLaser, t0, retry,
                     left, right, up, down,
@@ -1734,27 +1765,37 @@ class MainActivity : ComponentActivity() {
         enemyX = prefs.getInt("enemy_x", ENEMY_DEFAULT_X).coerceIn(ENEMY_X_RANGE)
         enemyY = prefs.getInt("enemy_y", ENEMY_DEFAULT_Y).coerceIn(ENEMY_Y_RANGE)
         enemyZ = prefs.getInt("enemy_z", ENEMY_DEFAULT_Z).coerceIn(ENEMY_Z_RANGE)
+        enemy2X = prefs.getInt("enemy2_x", ENEMY_DEFAULT_X).coerceIn(ENEMY_X_RANGE)
+        enemy2Y = prefs.getInt("enemy2_y", ENEMY_DEFAULT_Y).coerceIn(ENEMY_Y_RANGE)
+        enemy2Z = prefs.getInt("enemy2_z", ENEMY_DEFAULT_Z).coerceIn(ENEMY_Z_RANGE)
     }
 
-    /** フィールド選択画面の +/-。axis は 0 = x、1 = y、2 = z。変えたら保存して、すぐ送る。 */
+    /** フィールド選択画面の +/-。axis は 0 = x、1 = y、2 = z（ティア1）、3 = x、4 = y、5 = z（ティア2）。変えたら保存して、すぐ送る。 */
     private fun changeEnemy(axis: Int, delta: Int) {
         when (axis) {
             0 -> enemyX = (enemyX + delta).coerceIn(ENEMY_X_RANGE)
             1 -> enemyY = (enemyY + delta).coerceIn(ENEMY_Y_RANGE)
-            else -> enemyZ = (enemyZ + delta).coerceIn(ENEMY_Z_RANGE)
+            2 -> enemyZ = (enemyZ + delta).coerceIn(ENEMY_Z_RANGE)
+            3 -> enemy2X = (enemy2X + delta).coerceIn(ENEMY_X_RANGE)
+            4 -> enemy2Y = (enemy2Y + delta).coerceIn(ENEMY_Y_RANGE)
+            else -> enemy2Z = (enemy2Z + delta).coerceIn(ENEMY_Z_RANGE)
         }
         // 画面から離れるとすぐプロセスごと終了する（exitOnPause）ので、apply ではなく commit でその場で書く（saveSettings と同じ）
-        prefs.edit().putInt("enemy_x", enemyX).putInt("enemy_y", enemyY).putInt("enemy_z", enemyZ).commit()
+        prefs.edit().putInt("enemy_x", enemyX).putInt("enemy_y", enemyY).putInt("enemy_z", enemyZ)
+            .putInt("enemy2_x", enemy2X).putInt("enemy2_y", enemy2Y).putInt("enemy2_z", enemy2Z).commit()
         enemyLastSentMs = 0L
     }
 
-    /** 上りの 8 バイト。 */
+    /** 上りの 14 バイト。 */
     private fun enemyUpBytes(): ByteArray {
         val b = ByteBuffer.allocate(ENEMY_UP_SIZE).order(ByteOrder.LITTLE_ENDIAN)
         b.put(ENEMY_TAG)
         b.putShort(enemyX.toShort())
         b.putShort(enemyY.toShort())
         b.putShort(enemyZ.toShort())
+        b.putShort(enemy2X.toShort())
+        b.putShort(enemy2Y.toShort())
+        b.putShort(enemy2Z.toShort())
         val data = b.array()
         var sum = 0
         for (i in 1 until ENEMY_UP_SIZE - 1) sum += data[i].toInt() and 0xFF
@@ -1762,7 +1803,7 @@ class MainActivity : ComponentActivity() {
         return data
     }
 
-    /** UDP で届いた PC の返事（9 バイト）。和が合えば、PC が持っている値として覚える。 */
+    /** UDP で届いた PC の返事（15 バイト）。和が合えば、PC が持っている値として覚える。 */
     private fun applyEnemyAck(buf: ByteArray) {
         var sum = 0
         for (i in 1 until ENEMY_ACK_SIZE - 1) sum += buf[i].toInt() and 0xFF
@@ -1772,7 +1813,7 @@ class MainActivity : ComponentActivity() {
         }
         val b = ByteBuffer.wrap(buf, 1, ENEMY_ACK_SIZE - 2).order(ByteOrder.LITTLE_ENDIAN)
         val has = b.get().toInt() != 0
-        val xyz = listOf(b.short.toInt(), b.short.toInt(), b.short.toInt())
+        val xyz = List(6) { b.short.toInt() }
         enemyAck = if (has) xyz else null
     }
 
@@ -1789,8 +1830,8 @@ class MainActivity : ComponentActivity() {
             es920.setEnemy(up, confirmed)
             if (confirmed != wasConfirmed) {
                 appendLog(
-                    if (confirmed) "ENEMY TARGET OK: X $enemyX Y $enemyY Z $enemyZ"
-                    else "ENEMY TARGET SENDING: X $enemyX Y $enemyY Z $enemyZ"
+                    if (confirmed) "ENEMY TARGET OK: X $enemyX Y $enemyY Z $enemyZ / T2 X $enemy2X Y $enemy2Y Z $enemy2Z"
+                    else "ENEMY TARGET SENDING: X $enemyX Y $enemyY Z $enemyZ / T2 X $enemy2X Y $enemy2Y Z $enemy2Z"
                 )
                 wasConfirmed = confirmed
             }
@@ -1958,6 +1999,7 @@ class MainActivity : ComponentActivity() {
         selectedPlace = value
         // idoubake は HOJU の位置決め中に SELECT で選ぶもの。移動先を選び直したら hoju turn に戻す。
         hojuIdoubake = false
+        idoubakeTier = 1
         hataAdjustOtherRange = false
         baketuSpeedOtherBs = false
         if (value == "dekahoju") {
@@ -1998,6 +2040,7 @@ class MainActivity : ComponentActivity() {
     private fun clearMoveTarget() {
         selectedPlace = "none"
         hojuIdoubake = false
+        idoubakeTier = 1
         hataAdjustOtherRange = false
         baketuSpeedOtherBs = false
         hataLaser = false
@@ -2028,17 +2071,23 @@ class MainActivity : ComponentActivity() {
     /**
      * SELECT ボタンで MOVE TARGET を順送りする。選択中の移動先が順送りのボタン（BS2 / BS3）のものなら、
      * そのボタンを押したときと同じく次へ送る。HATA_T / HATA_O ならもう一方に切り替える。
-     * HOJU なら、移動バケツ（idoubake）にする（移動先は HOJU のまま。もう一度押しても戻さない。hojuIdoubake の説明）。
+     * HOJU なら、移動バケツ（idoubake）にする（移動先は HOJU のまま。入っている間はティア1 / 2 を入れ替える。hojuIdoubake の説明）。
      * それ以外（none・HATA_FAR 含む）のときは何もしない。
      */
     private fun cycleSelectTarget() {
         if (selectedPlace == "hoju") {
-            // ロボットの drive2 と同じく、前後のスティックを倒している間は入らない。入っていれば何もしない
-            if (!hojuIdoubake && !hojuLineStickTilted()) {
+            // ロボットの drive2 と同じく、前後のスティックを倒している間は入らず、ティアも入れ替えない
+            if (hojuLineStickTilted()) return
+            if (!hojuIdoubake) {
                 hojuIdoubake = true
+                idoubakeTier = 1
                 appendLog("HOJU TURN: IDOUBAKE")
                 // L2 / R2 を押したまま入ったときも連続調整を始める
                 if (l2 || r2) startHataTurnRepeat()
+            } else {
+                // 入っていればティアを入れ替える（パスの途中で押した回数で入れ替わるのも drive2 と同じ）
+                idoubakeTier = if (idoubakeTier == 1) 2 else 1
+                appendLog("HOJU TURN: IDOUBAKE $idoubakeTier")
             }
             return
         }
@@ -2097,10 +2146,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
             // idoubake の間は、ロボットが使っている idoubake turn を動かす。
-            // x / y は狙う点を動かす量で、1 回 idoubakeTurnXYStep（100 mm）。theta はほかの turn と同じ刻み。
+            // x / y は狙う点を動かす量で、1 回 idoubakeTurnXYStep（100 mm）。今狙っているティアの分を動かす。
+            // theta はほかの turn と同じ刻みで、2 つのティアで共通。
             TurnTarget.HOJU -> if (hojuIdoubake) {
-                idoubake_turnx = xy(idoubake_turnx, Math.signum(dx) * idoubakeTurnXYStep)
-                idoubake_turny = xy(idoubake_turny, Math.signum(dy) * idoubakeTurnXYStep)
+                if (idoubakeTier == 2) {
+                    idoubake2_turnx = xy(idoubake2_turnx, Math.signum(dx) * idoubakeTurnXYStep)
+                    idoubake2_turny = xy(idoubake2_turny, Math.signum(dy) * idoubakeTurnXYStep)
+                } else {
+                    idoubake_turnx = xy(idoubake_turnx, Math.signum(dx) * idoubakeTurnXYStep)
+                    idoubake_turny = xy(idoubake_turny, Math.signum(dy) * idoubakeTurnXYStep)
+                }
                 idoubake_turntheta = theta(idoubake_turntheta, dtheta)
             } else {
                 hoju_turnx = xy(hoju_turnx, dx)
@@ -2220,6 +2275,13 @@ class MainActivity : ComponentActivity() {
             .coerceIn(IDOUBAKE_SPEED_DIF_MIN, IDOUBAKE_SPEED_DIF_MAX)
     }
 
+    /** ティア2 の射出速度の差を delta 分動かす（IDOUBAKE_SPEED_DIF_MIN〜MAX）。 */
+    private fun adjustIdoubake2SpeedDif(delta: Float) {
+        if (!settingsSynced) return
+        idoubake2SpeedDif = (idoubake2SpeedDif + delta).roundToScale(SPEED_SCALE)
+            .coerceIn(IDOUBAKE_SPEED_DIF_MIN, IDOUBAKE_SPEED_DIF_MAX)
+    }
+
     /** 選択中の OBJECT の column（1..3）の速度を delta 分動かす。範囲は物体ごと。 */
     private fun adjustSelectedObjectSpeed(column: Int, delta: Float) {
         if (!settingsSynced) return
@@ -2331,6 +2393,7 @@ class MainActivity : ComponentActivity() {
         hojuSpeed1: Float, hojuSpeed2: Float, hojuSpeed3: Float,
         idoubakeTurnX: Float, idoubakeTurnY: Float, idoubakeTurnTheta: Float, idoubake: Boolean,
         idoubakeSpeedDif: Float,
+        idoubake2TurnX: Float, idoubake2TurnY: Float, idoubake2SpeedDif: Float,
         selectedSpeed: String, selectedPlace: String,
         hataLaser: Boolean, hojuLaser: Boolean, t0: Boolean, retry: Boolean,
         left: Boolean, right: Boolean, up: Boolean, down: Boolean,
@@ -2358,7 +2421,8 @@ class MainActivity : ComponentActivity() {
             // 86      i16×3 speed（hoju の 1..3）
             // 92      i16×3 turn（移動バケツ idoubake 用の x, y, theta）
             // 98      i16   移動バケツの射出速度の差 idoubake_speed_dif（2026-11-08）
-            // 100     u8    空き（0。設定値を 29 byte × 3 に割り切るため）
+            // 100     i16×3 移動バケツのティア2 の turn x, y と射出速度の差（2026-11-11）
+            // 106     u8    空き（0。設定値を 31 byte × 3 に割り切るため）
             val buttons = listOf(
                 left, right, up, down,
                 circle, triangle, square, cross,
@@ -2423,7 +2487,10 @@ class MainActivity : ComponentActivity() {
             buf.putScaled(idoubakeTurnY, TURN_XY_SCALE)
             buf.putScaled(idoubakeTurnTheta, TURN_THETA_SCALE)
             buf.putScaled(idoubakeSpeedDif, SPEED_SCALE)
-            // 100 byte 目は空き（allocate で 0 のまま）
+            buf.putScaled(idoubake2TurnX, TURN_XY_SCALE)
+            buf.putScaled(idoubake2TurnY, TURN_XY_SCALE)
+            buf.putScaled(idoubake2SpeedDif, SPEED_SCALE)
+            // 106 byte 目は空き（allocate で 0 のまま）
 
             sendTime = System.nanoTime()
             // LoRa にも同じものを渡す（送るのは Es920Link のループ。ここでは待たない）。
@@ -2872,7 +2939,9 @@ private fun SpeedStepButton(
 @Composable
 fun TeamSelectionScreen(
     // 相手のバケツの位置 [mm] と、PC に届いているか。+/- で onEnemyChange(axis 0 = x / 1 = y / 2 = z, 増やす量)
+    // axis 3 = ティア2 の x / 4 = y / 5 = z
     enemyX: Int, enemyY: Int, enemyZ: Int,
+    enemy2X: Int, enemy2Y: Int, enemy2Z: Int,
     enemyConfirmed: Boolean,
     onEnemyChange: (axis: Int, delta: Int) -> Unit,
     isFlipped: Boolean,
@@ -2964,7 +3033,7 @@ fun TeamSelectionScreen(
                     height = 50.dp,
                     accent = if (isFlipped) ControllerColors.Warning else ControllerColors.Border
                 )
-                EnemyTargetPanel(enemyX, enemyY, enemyZ, enemyConfirmed, onEnemyChange)
+                EnemyTargetPanel(enemyX, enemyY, enemyZ, enemy2X, enemy2Y, enemy2Z, enemyConfirmed, onEnemyChange)
             }
             LoraChannelPanel(lora = lora, onSelectLink = onSelectLoraLink, onScan = onScanLora, onSelect = onSelectLoraChannel)
         }
@@ -2977,7 +3046,8 @@ fun TeamSelectionScreen(
  */
 @Composable
 private fun EnemyTargetPanel(
-    x: Int, y: Int, z: Int,
+    x1: Int, y1: Int, z1: Int,
+    x2: Int, y2: Int, z2: Int,
     confirmed: Boolean,
     onChange: (axis: Int, delta: Int) -> Unit
 ) {
@@ -2991,26 +3061,45 @@ private fun EnemyTargetPanel(
                 fontWeight = FontWeight.Bold
             )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("X" to x, "Y" to y, "Z" to z).forEachIndexed { axis, (label, value) ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    HudButton(
-                        text = "-", onClick = { onChange(axis, -ENEMY_STEP) },
-                        modifier = Modifier.width(34.dp), height = 34.dp, fontSize = 16.sp
-                    )
-                    Text(
-                        text = "$label $value",
-                        color = ControllerColors.TextPrimary,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.width(58.dp)
-                    )
-                    HudButton(
-                        text = "+", onClick = { onChange(axis, ENEMY_STEP) },
-                        modifier = Modifier.width(34.dp), height = 34.dp, fontSize = 16.sp
-                    )
-                }
+        // ティア1 / 2 を 2 行に並べる（2026-11-11。並べ方は実機で調整する）
+        EnemyTargetRow("T1", listOf("X" to x1, "Y" to y1, "Z" to z1), axisOffset = 0, onChange = onChange)
+        EnemyTargetRow("T2", listOf("X" to x2, "Y" to y2, "Z" to z2), axisOffset = 3, onChange = onChange)
+    }
+}
+
+@Composable
+private fun EnemyTargetRow(
+    tier: String,
+    values: List<Pair<String, Int>>,
+    axisOffset: Int,
+    onChange: (axis: Int, delta: Int) -> Unit
+) {
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = tier,
+            color = ControllerColors.TextSecondary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.width(20.dp)
+        )
+        values.forEachIndexed { axis, (label, value) ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                HudButton(
+                    text = "-", onClick = { onChange(axisOffset + axis, -ENEMY_STEP) },
+                    modifier = Modifier.width(30.dp), height = 34.dp, fontSize = 16.sp
+                )
+                Text(
+                    text = "$label $value",
+                    color = ControllerColors.TextPrimary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.width(54.dp)
+                )
+                HudButton(
+                    text = "+", onClick = { onChange(axisOffset + axis, ENEMY_STEP) },
+                    modifier = Modifier.width(30.dp), height = 34.dp, fontSize = 16.sp
+                )
             }
         }
     }
@@ -3471,7 +3560,10 @@ fun ControllerUI(
     hojuTurnX: Float, hojuTurnY: Float, hojuTurnTheta: Float,
     // 移動バケツの turn と、HOJU の位置決め中に SELECT で idoubake にしているか。
     idoubakeTurnX: Float, idoubakeTurnY: Float, idoubakeTurnTheta: Float,
+    idoubake2TurnX: Float, idoubake2TurnY: Float,
     hojuIdoubake: Boolean,
+    // 今狙っているティア（1 か 2）
+    idoubakeTier: Int,
     bs2TurnX: Float, bs2TurnY: Float, bs2TurnTheta: Float,
     bs3TurnX: Float, bs3TurnY: Float, bs3TurnTheta: Float,
     selectedTurnTarget: TurnTarget,
@@ -3508,6 +3600,10 @@ fun ControllerUI(
     idoubakeSpeedDif: Float,
     onSpeedDifIncrease: () -> Unit,
     onSpeedDifDecrease: () -> Unit,
+    // ティア2 の射出速度の差。DIF2 の行で +/-
+    idoubake2SpeedDif: Float,
+    onSpeedDif2Increase: () -> Unit,
+    onSpeedDif2Decrease: () -> Unit,
     logList: List<String>,
     hojuState: String,
     t0locked: Boolean,
@@ -3921,18 +4017,28 @@ fun ControllerUI(
                         onDecrease = { onSpeedDecrease(3) },
                         accent = speedAccent
                     )
-                    // HOJU のときだけ、移動バケツの射出速度の差（idoubake_speed_dif）の行を出す。
-                    // idoubake（SELECT）にしている間は色を変える（TURN の IDOUBK の行と同じ）。
+                    // HOJU のときだけ、移動バケツの射出速度の差の行をティアごとに出す（DIF1 / DIF2）。
+                    // idoubake（SELECT）にしている間は、今のティアの行だけ色を変える（TURN の IDOUBK の行と同じ）。
                     if (selectedSpeed == "hoju") {
                         SpeedAdjustRow(
                             modifier = Modifier.weight(1f),
-                            label = "DIF",
+                            label = "DIF1",
                             value = idoubakeSpeedDif,
                             range = IDOUBAKE_SPEED_DIF_MIN..IDOUBAKE_SPEED_DIF_MAX,
                             enabled = settingsSynced,
                             onIncrease = onSpeedDifIncrease,
                             onDecrease = onSpeedDifDecrease,
-                            accent = if (hojuIdoubake) ControllerColors.Warning else speedAccent
+                            accent = if (hojuIdoubake && idoubakeTier == 1) ControllerColors.Warning else speedAccent
+                        )
+                        SpeedAdjustRow(
+                            modifier = Modifier.weight(1f),
+                            label = "DIF2",
+                            value = idoubake2SpeedDif,
+                            range = IDOUBAKE_SPEED_DIF_MIN..IDOUBAKE_SPEED_DIF_MAX,
+                            enabled = settingsSynced,
+                            onIncrease = onSpeedDif2Increase,
+                            onDecrease = onSpeedDif2Decrease,
+                            accent = if (hojuIdoubake && idoubakeTier == 2) ControllerColors.Warning else speedAccent
                         )
                     }
                 }
@@ -4029,7 +4135,7 @@ fun ControllerUI(
             contentPadding = 4.dp
         ) {
             HudSectionTitle(
-                if (settingsSynced) "TURN ADJUST  /  ${selectedTurnTarget.displayName(hataAdjustNear, hataO, hojuIdoubake)}" else "TURN ADJUST  /  SYNC...",
+                if (settingsSynced) "TURN ADJUST  /  ${selectedTurnTarget.displayName(hataAdjustNear, hataO, hojuIdoubake, idoubakeTier)}" else "TURN ADJUST  /  SYNC...",
                 if (settingsSynced) ControllerColors.Warning else ControllerColors.Danger,
                 10.sp
             )
@@ -4042,8 +4148,12 @@ fun ControllerUI(
                 Text("HATA_O X ${"%.2f".format(hataOTurnX)} Y ${"%.2f".format(hataOTurnY)} T ${"%.2f".format(hataOTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
                 Text("HOJU   X ${"%.2f".format(hojuTurnX)} Y ${"%.2f".format(hojuTurnY)} T ${"%.2f".format(hojuTurnTheta)}", color = ControllerColors.TextPrimary, fontSize = 8.sp)
                 // 移動バケツの turn。HOJU の位置決め中に SELECT で idoubake にしている間は色を変える（TURN ADJUST が動かすのはこの行）。
+                // 行は増やさず今のティアの値を出す（移動バケツ中でなければティア1）。theta は共通。
+                val shownTier = if (hojuIdoubake) idoubakeTier else 1
+                val shownTurnX = if (shownTier == 2) idoubake2TurnX else idoubakeTurnX
+                val shownTurnY = if (shownTier == 2) idoubake2TurnY else idoubakeTurnY
                 Text(
-                    "IDOUBK X ${"%.2f".format(idoubakeTurnX)} Y ${"%.2f".format(idoubakeTurnY)} T ${"%.2f".format(idoubakeTurnTheta)}",
+                    "IDOUBK$shownTier X ${"%.2f".format(shownTurnX)} Y ${"%.2f".format(shownTurnY)} T ${"%.2f".format(idoubakeTurnTheta)}",
                     color = if (hojuIdoubake) ControllerColors.Warning else ControllerColors.TextPrimary,
                     fontSize = 8.sp
                 )
@@ -4115,13 +4225,13 @@ fun ControllerUI(
 }
 
 /** TURN ADJUST の見出し。旗は調整している方（HATA_T / HATA_O / FAR）も出す。 */
-fun TurnTarget.displayName(hataNear: Boolean, hataO: Boolean, hojuIdoubake: Boolean = false): String = when (this) {
+fun TurnTarget.displayName(hataNear: Boolean, hataO: Boolean, hojuIdoubake: Boolean = false, idoubakeTier: Int = 1): String = when (this) {
     TurnTarget.HATA -> when {
         !hataNear -> "HATA FAR"
         hataO -> "HATA_O"
         else -> "HATA_T"
     }
-    TurnTarget.HOJU -> if (hojuIdoubake) "HOJU (IDOUBAKE)" else "HOJU"
+    TurnTarget.HOJU -> if (hojuIdoubake) "HOJU (IDOUBAKE $idoubakeTier)" else "HOJU"
     TurnTarget.BS2 -> "BS2"
     TurnTarget.BS3 -> "BS3"
 }

@@ -83,8 +83,8 @@ private class Es920Profile(
     /** protocol とプロトコル専用の設定。コマンドの体系が変わるので protocol を最初に送る。 */
     val radioCommands: List<String>,
     /**
-     * 設定値を送るときの形。true: 1 回 50 バイトまで（LoRa）なので、操作 + 設定値 29 バイトずつの 45 バイトを 3 回。
-     * false: 操作 + 設定値 87 バイトの 103 バイトを 1 回（FSK は 225 バイトまで）。設定値を送らない回は、どちらも 16 バイト。
+     * 設定値を送るときの形。true: 1 回 50 バイトまで（LoRa）なので、操作 + 設定値 31 バイトずつの 47 バイトを 3 回。
+     * false: 操作 + 設定値 93 バイトの 109 バイトを 1 回（FSK は 225 バイトまで）。設定値を送らない回は、どちらも 16 バイト。
      */
     val chunked: Boolean,
     /** 1 回の送信の空中時間の見積もり [µs] = base + perByte × 文字数。少し多めにしてある。 */
@@ -227,14 +227,14 @@ private const val ES920_BINARY = true
 // --- 無線で送る 1 回分の中身（PC 側は con.py の decode_lora_bytes / LoraAssembler。必ず合わせる）
 //   offset  size  中身
 //    0      14    パケットの 0〜13 バイト（PACKET_VERSION / map / object / target / ボタン・通し番号 / vx vy w）
-//   14      1     bit0-1: 設定値の何番目の 29 バイトか（0〜2。29 バイトに分けて送るときだけ意味がある）
+//   14      1     bit0-1: 設定値の何番目の 31 バイトか（0〜2。31 バイトに分けて送るときだけ意味がある）
 //                 bit7  : このあと受信する印（LORA_LISTEN_FLAG）
 //   15      1     設定値の番号（0〜255）。設定値・マップ・synced のどれかが変わるたびに 1 増やす
 //   16      ...   設定値。種類は長さで決まる:
 //     16 バイト（操作だけ）: 設定値なし。ふだんはこれ（短いので速く送れる）
-//     45 バイト（分割）    : 設定値の 29×n 〜 29×n+28 バイト（LoRa。1 回 50 バイトまでなので 3 回に分ける）
-//     103 バイト（まるごと）: 設定値 87 バイト（FSK）
-// 設定値はパケットの 14〜100 バイトと同じ並び・倍率（最後の 1 バイトは空き）。2026-11-08 に 28 → 29 バイト（version 18）。
+//     47 バイト（分割）    : 設定値の 31×n 〜 31×n+30 バイト（LoRa。1 回 50 バイトまでなので 3 回に分ける）
+//     109 バイト（まるごと）: 設定値 93 バイト（FSK）
+// 設定値はパケットの 14〜106 バイトと同じ並び・倍率（最後の 1 バイトは空き）。2026-11-11 に 29 → 31。2026-11-08 に 28 → 29 バイト（version 18）。
 // 番号を進めたときに設定値を写し取り、その番号の分割はすべて写しから送る（別の時刻の値を混ぜないため）。
 // 設定値を送るのは、変わったとき（ES920_SETTINGS_ROUNDS_ON_CHANGE 回ぶん）と、PC に届いた確認が取れていない間の
 // ES920_SETTINGS_REFRESH_MS ごと。PC は持っている設定値の番号を自己位置の行で知らせてくる（下の ES920_POSE_*）。
@@ -255,17 +255,17 @@ private fun buttonsOf(packet: ByteArray): Int {
     for (i in 0 until 4) v = v or ((packet[LORA_BUTTONS_OFFSET + i].toInt() and 0xFF) shl (8 * i))
     return v
 }
-private const val LORA_CHUNK_SIZE = 29
+private const val LORA_CHUNK_SIZE = 31
 private const val LORA_CHUNK_COUNT = 3
 private const val LORA_SETTINGS_SIZE = LORA_CHUNK_SIZE * LORA_CHUNK_COUNT
 private const val LORA_CONTROL_SIZE = LORA_HEAD_SIZE + 2
 private const val LORA_CHUNK_FRAME_SIZE = LORA_CONTROL_SIZE + LORA_CHUNK_SIZE
 private const val LORA_FULL_FRAME_SIZE = LORA_CONTROL_SIZE + LORA_SETTINGS_SIZE
-// 相手のバケツの位置（2026-11-08）。操作だけの 16 バイトの後ろに、MainActivity の enemyUpBytes()（8 バイト:
-// ENEMY_TAG / i16 x / i16 y / i16 z / 和）を付けた 24 バイトの行で送る。con.py の LORA_ENEMY_FRAME_SIZE / decode_enemy と合わせる。
+// 相手のバケツの位置（2026-11-08。2026-11-11 に 2 組）。操作だけの 16 バイトの後ろに、MainActivity の enemyUpBytes()（14 バイト:
+// ENEMY_TAG / i16 x1 y1 z1 x2 y2 z2 / 和）を付けた 30 バイトの行で送る。con.py の LORA_ENEMY_FRAME_SIZE / decode_enemy と合わせる。
 // 設定値を載せない回に、PC に届いたと分かるまでは ES920_ENEMY_RESEND_MS ごと、分かってからは ES920_ENEMY_CHECK_MS ごとに載せる。
-// 届いたかは、状態の行の 25〜31 バイト（PC が持っている値）で分かる（Wi-Fi が生きている間は UDP の返事で分かる）。
-private const val LORA_ENEMY_BLOCK_SIZE = 8
+// 届いたかは、状態の行の 25〜37 バイト（PC が持っている値）で分かる（Wi-Fi が生きている間は UDP の返事で分かる）。
+private const val LORA_ENEMY_BLOCK_SIZE = 14
 private const val LORA_ENEMY_FRAME_SIZE = LORA_CONTROL_SIZE + LORA_ENEMY_BLOCK_SIZE
 private const val ES920_ENEMY_RESEND_MS = 300L
 private const val ES920_ENEMY_CHECK_MS = 5000L
@@ -281,11 +281,11 @@ private const val ES920_SETTINGS_CONFIRM_WARN_MS = 2000L
 // --- 無線で受け取る 1 回分（PC の con.py が、同期待ちのスマホへ設定値を送り返す）
 // UDP（ログ用ポート 5006）が届かず ES920LR だけでつながっているときの SYNC 用。con.py の LORA_SETTINGS_* と合わせる。
 // con.py は、こちらが送ってきた形（3 分割かどうか）に合わせて返してくる。
-// FSK: 次の 89 バイトを 1 回。
-//    0  1  LORA_SETTINGS_TAG / 1  1  map_id（PACKET_MAP_IDS の番号）/ 2  87  設定値
-// LoRa: 次の 32 バイトを 3 回。
-//    0  1  LORA_SETTINGS_TAG / 1  1  map_id / 2  1  何番目の 29 バイトか（0〜2）/ 3  29  設定値の 29×n〜
-// 設定値は送るパケットの 14〜100 バイトと同じ並び・倍率。
+// FSK: 次の 95 バイトを 1 回。
+//    0  1  LORA_SETTINGS_TAG / 1  1  map_id（PACKET_MAP_IDS の番号）/ 2  93  設定値
+// LoRa: 次の 34 バイトを 3 回。
+//    0  1  LORA_SETTINGS_TAG / 1  1  map_id / 2  1  何番目の 31 バイトか（0〜2）/ 3  31  設定値の 31×n〜
+// 設定値は送るパケットの 14〜106 バイトと同じ並び・倍率。
 // 受け取ったデータの先頭には RSSI と送り元の PAN ID・ID が付く（rssi 1 / rcvid 1 のため）。
 // その長さに頼らないよう、末尾を決まった長さ（下の受け取る種類の長さ）ごとに読んでみる。
 private const val LORA_SETTINGS_TAG: Byte = 0x53
@@ -298,10 +298,10 @@ private const val LORA_SETTINGS_CHUNK_SIZE = 3 + LORA_CHUNK_SIZE
 // （offset 14 の bit7）を付け、返事（OK）から最大 ES920_POSE_LISTEN_MS の間は送らずに受信する。
 // 状態の行が届いたら、そこで受信をやめてすぐ送信に戻る（操作の Hz をなるべく落とさないため）。
 // con.py は印を見たら、積んであるログの行を 1 つ（あれば）、続けて状態の行を送ってくる:
-//   状態の行（34 バイト）:
+//   状態の行（40 バイト）:
 //     0 u8 LORA_STATUS_TAG / 1 15 バイト 自己位置（UDP の自己位置と同じ並び）/ 16 8 バイト hojustate（ASCII、余りは 0）/
-//     24 u8 invalid_target の番号 / 25 7 バイト PC が持っている相手のバケツの位置（u8 has / i16 x / i16 y / i16 z。2026-11-08 追加）/
-//     32 u8 LORA_STATUS_TAG / 33 u8 1〜31 バイトの和の下位 8 bit
+//     24 u8 invalid_target の番号 / 25 13 バイト PC が持っている相手のバケツの位置（u8 has / i16 x1 y1 z1 x2 y2 z2。2026-11-08 追加、2026-11-11 に 2 組）/
+//     38 u8 LORA_STATUS_TAG / 39 u8 1〜37 バイトの和の下位 8 bit
 //     自己位置の 13 / 14 バイト目に、PC が持っている設定値の状態が入る（設定値が届いたかの確認）:
 //       13: bit0 = 設定値を持っている / 14: その番号
 //   ログの行（/log の 1 行。4 + n バイト、n は 0〜LORA_LOG_MAX_BYTES）:
@@ -319,7 +319,7 @@ private const val LORA_LISTEN_FLAG = 0x80
 private const val LORA_STATUS_TAG: Byte = 0x50
 private const val LORA_POSE_SIZE = 15
 private const val LORA_HOJU_SIZE = 8
-private const val LORA_ENEMY_ECHO_SIZE = 7
+private const val LORA_ENEMY_ECHO_SIZE = 13
 private const val LORA_STATUS_FRAME_SIZE = 1 + LORA_POSE_SIZE + LORA_HOJU_SIZE + 1 + LORA_ENEMY_ECHO_SIZE + 2
 private const val LORA_LOG_TAG: Byte = 0x4C
 private const val LORA_LOG_MAX_BYTES = 45
@@ -397,7 +397,7 @@ class Es920Group(
         )
     }
 
-    // 相手のバケツの位置の上りの 8 バイト（null は送らない）と、PC に届いたと分かっているか。MainActivity が setEnemy で入れる
+    // 相手のバケツの位置の上りの 14 バイト（null は送らない）と、PC に届いたと分かっているか。MainActivity が setEnemy で入れる
     @Volatile
     internal var enemyBlock: ByteArray? = null
         private set
@@ -405,7 +405,7 @@ class Es920Group(
     internal var enemyConfirmed = false
         private set
 
-    /** 相手のバケツの位置（上りの 8 バイト）と、PC に届いたと分かっているかを渡す。どの組も設定値を載せない回に載せる。 */
+    /** 相手のバケツの位置（上りの 14 バイト）と、PC に届いたと分かっているかを渡す。どの組も設定値を載せない回に載せる。 */
     fun setEnemy(block: ByteArray, confirmed: Boolean) {
         enemyBlock = block
         enemyConfirmed = confirmed
@@ -576,7 +576,7 @@ class Es920Link internal constructor(
     /** 組の番号（0 = A、1 = B）。 */
     val index: Int,
     private val log: (String) -> Unit,
-    // 設定値が届いたら呼ぶ（map_id の番号, 87 バイト）。IO スレッドから呼ぶ。
+    // 設定値が届いたら呼ぶ（map_id の番号, 93 バイト）。IO スレッドから呼ぶ。
     private val onSettings: (Int, ByteArray) -> Unit,
     // true の間は SYNC 待ち（PC からの設定値を待っている）。IO スレッドから呼ぶ。
     private val waitingSettings: () -> Boolean,
@@ -699,7 +699,7 @@ class Es920Link internal constructor(
     private var frameSinceMs = 0L
 
     // --- 送る設定値（encodeFrame）
-    private var txKey: ByteArray? = null                 // 設定値 87 バイト + map + synced。変わったら番号を進める
+    private var txKey: ByteArray? = null                 // 設定値 93 バイト + map + synced。変わったら番号を進める
     private var txGen = 0                                 // 設定値の番号（0〜255）
     private val txSettings = ByteArray(LORA_SETTINGS_SIZE) // 番号を進めたときに写し取った設定値
     private var txGenAtMs = 0L                            // 番号を進めた時刻
@@ -1245,10 +1245,10 @@ class Es920Link internal constructor(
                 val hoju = String(frame, 1 + LORA_POSE_SIZE, LORA_HOJU_SIZE, Charsets.US_ASCII).trimEnd('\u0000')
                 val invalidAt = 1 + LORA_POSE_SIZE + LORA_HOJU_SIZE
                 onStatus(pose, hoju, frame[invalidAt].toInt() and 0xFF)
-                // PC が持っている相手のバケツの位置（u8 has / i16 x / i16 y / i16 z）
+                // PC が持っている相手のバケツの位置（u8 has / i16 x1 y1 z1 x2 y2 z2）
                 val echo = java.nio.ByteBuffer.wrap(frame, invalidAt + 1, LORA_ENEMY_ECHO_SIZE).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                 val has = echo.get().toInt() != 0
-                val xyz = intArrayOf(echo.short.toInt(), echo.short.toInt(), echo.short.toInt())
+                val xyz = IntArray(6) { echo.short.toInt() }
                 onEnemyEcho(if (has) xyz else null)
                 return
             }
@@ -1259,7 +1259,7 @@ class Es920Link internal constructor(
             if (group.acceptLog(seq, now)) onLog(text)
             return
         }
-        // FSK の設定値（89 バイト、1 回）
+        // FSK の設定値（95 バイト、1 回）
         tail(ev, LORA_SETTINGS_FULL_SIZE)?.let { frame ->
             if (frame[0] == LORA_SETTINGS_TAG) {
                 rxSettingsLines++
@@ -1268,7 +1268,7 @@ class Es920Link internal constructor(
                 return
             }
         }
-        // LoRa の設定値の 3 回のうちの 1 回（32 バイト）
+        // LoRa の設定値の 3 回のうちの 1 回（34 バイト）
         val frame = tail(ev, LORA_SETTINGS_CHUNK_SIZE) ?: return
         if (frame[0] != LORA_SETTINGS_TAG) return
         val map = frame[1].toInt() and 0xFF
